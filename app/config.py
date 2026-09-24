@@ -3,7 +3,9 @@
 MONGO_URL
     ``mongomock://`` (the default) uses an in-memory Mongo, which is what
     ``make test`` does. Anything else is passed to Motor as a real connection
-    string, e.g. ``mongodb://localhost:27017/?replicaSet=rs0``.
+    string, e.g. ``mongodb://localhost:27017/?directConnection=true`` for the
+    ``docker compose`` replica set from your machine (inside compose the api
+    service uses ``mongodb://mongo:27017/?replicaSet=rs0``).
 MONGO_DB
     Database name. Defaults to ``rayy_exercise``.
 GATEWAY_WEBHOOK_SECRET
