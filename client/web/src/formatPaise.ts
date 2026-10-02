@@ -10,5 +10,22 @@
  * Throws an Error if `paise` is not an integer.
  */
 export function formatPaise(paise: number): string {
-  throw new Error("not implemented");
+  if (!Number.isInteger(paise)) {
+    throw new Error(`formatPaise expects an integer number of paise, got ${paise}`);
+  }
+
+  const sign = paise < 0 ? "-" : "";
+  const abs = Math.abs(paise);
+  const rupees = Math.floor(abs / 100);
+  const remainder = abs % 100; // exact for safe integers; no fractional rounding
+
+  // en-IN grouping: last three digits, then the rest in pairs.
+  const digits = String(rupees);
+  const lastThree = digits.slice(-3);
+  const rest = digits.slice(0, -3);
+  const grouped = rest
+    ? rest.replace(/\B(?=(\d{2})+(?!\d))/g, ",") + "," + lastThree
+    : lastThree;
+
+  return `₹${sign}${grouped}.${String(remainder).padStart(2, "0")}`;
 }

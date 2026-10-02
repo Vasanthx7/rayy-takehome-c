@@ -12,6 +12,29 @@ class OrderItem(BaseModel):
     quantity: int = Field(ge=1)
 
 
+class DiscountApplied(BaseModel):
+    """A discount recorded on an order.
+
+    ``partner_amount_paise`` + ``rayy_amount_paise`` = ``amount_paise``. The
+    share bps are snapshotted at apply time so monthly settlement stays correct
+    even if the code's split ratio changes later.
+    """
+
+    code: str
+    amount_paise: int = Field(ge=0)
+    partner_share_bps: int = Field(ge=0, le=10000)
+    rayy_share_bps: int = Field(ge=0, le=10000)
+    partner_amount_paise: int = Field(ge=0)
+    rayy_amount_paise: int = Field(ge=0)
+
+
+class PaymentRecord(BaseModel):
+    """A successful payment recorded on an order."""
+
+    payment_id: str
+    amount_paise: int = Field(ge=0)
+
+
 class Order(BaseModel):
     order_id: str
     partner_id: str
@@ -21,6 +44,8 @@ class Order(BaseModel):
     currency: str = "INR"
     status: str
     created_at: datetime
+    discount: DiscountApplied | None = None
+    payment: PaymentRecord | None = None
 
 
 class DiscountCode(BaseModel):

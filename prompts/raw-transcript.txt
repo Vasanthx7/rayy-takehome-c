@@ -1,0 +1,3372 @@
+ ▐▛███▜▌   Claude Code v2.1.216
+▝▜█████▛▘  Opus 4.8 · Claude Team
+  ▘▘ ▝▝    ~\work\assesements\rayy-takehome-c
+
+
+> /init                                                                         
+
+● I'll analyze this codebase to create a CLAUDE.md file. Let me explore the
+  structure.
+
+  Searched for 1 pattern, ran 1 shell command (ctrl+o to expand)
+
+● I'll read the key files to understand the architecture.
+
+  Read 6 files (ctrl+o to expand)
+
+● Now the app source files:
+
+  Read 17 files (ctrl+o to expand)
+
+● Let me check client build configs and remaining starter files.
+
+  Read 4 files, listed 1 directory (ctrl+o to expand)
+
+● This is a take-home assessment with a layered FastAPI service plus client
+  starters. There's no existing CLAUDE.md. I have enough to write one.
+
+● Write(CLAUDE.md)
+  ⎿  Wrote 85 lines to CLAUDE.md
+       1 # CLAUDE.md
+       3 This file provides guidance to Claude Code (claude.ai/code) when
+          working with code in this repository.
+       5 ## What this is
+       6 
+          applying partner
+       8 discount codes to orders and processing payment-gateway webhooks
+       9 starter (React or Flutter). The brief, acceptance criteria, and 
+         deliverables live
+         ct contracts
+     … +114 lines (ctrl+o to expand)
+
+● I've created CLAUDE.md. Here's what it captures:
+
+  Commands — the make targets (noting the mongomock vs. real-replica-set split),
+  single-test invocation, docker-compose, and both client toolchains.
+
+  Architecture — the key insight that requires reading several files: the strict
+  api → services → repositories → db layering, with the README's grading rule
+  that pricing/money logic must stay out of route handlers. I documented the
+  non-obvious decisions:
+
+  - Money is integer paise, float arithmetic forbidden; the fractional-paise
+  rounding rule is deliberately unspecified.
+  - Discount codes are config, not DB data — loaded from JSON + lru_cache, with
+  basis-point percentages and the partner_share_bps/rayy_share_bps settlement
+  split.
+  - Gateway webhook contract — HMAC-SHA256 signature verification +
+  at-least-once delivery, so the handler must be idempotent.
+  - mongomock has no transactions — a real gotcha that routes test strategy.
+  - Mongo _id ↔ order_id translation, lazy client for test env setup.
+
+  Unimplemented deliverables — the stubs to build (the two POST routes,
+  formatPaise, OrderSummary) plus the required NOTES.md and prompts/ folder.
+
+  Two notes:
+  - There are no Cursor/Copilot rule files, and no OpenAI Codex or Gemini CLI
+  configs in the repo, so nothing to import there.
+  - prompts/ and NOTES.md don't exist yet — they're required for this take-home
+  to pass, so worth creating as you work.
+
+✻ Churned for 1m 20s
+
+> Inspect the repository and explain:                                           
+                                                                                
+  The current application architecture and request flow.The existing order      
+  schema and how orders are persisted.How the payment gateway stub behaves,     
+  including its failure modes.The existing test structure and how to run the    
+  tests.Which existing abstractions should be reused.Potential risks involving  
+  duplicate payment webhooks, concurrent discount application, monetary         
+  precision, and settlement accuracy.Separate confirmed observations from       
+  assumptions. Reference the relevant files and functions.                      
+                                                                                
+  Finish with a concise implementation plan and a list of unanswered questions. 
+
+● I've already read most of the repo. Let me fill a couple of gaps before
+  writing up.
+
+  Searched for 1 pattern, read 2 files (ctrl+o to expand)
+
+● I now have a complete picture. Here's the analysis.
+
+  ---
+  Repository Analysis: RAYY partner-discounts service
+
+  1. Application architecture & request flow
+
+  Confirmed. A FastAPI service with strict horizontal layering. app/main.py:5-8
+  builds the app and mounts two routers (health, orders). The flow is:
+
+  HTTP → app/api/*.py → app/services/*.py → app/repositories/*.py → app/db.py →
+  Mongo
+
+  - API layer (app/api/orders.py): thin. Routes only route and map errors — e.g.
+  get_order (orders.py:14-19) catches orders_service.OrderNotFound and raises
+  HTTPException(404). No logic.
+  - Service layer (app/services/orders.py): business rules, HTTP-free. get_order
+  (services/orders.py:11-15) fetches via the repo and raises the domain
+  exception OrderNotFound (services/orders.py:7-8); list_orders maps docs to
+  Order models.
+  - Repository layer (app/repositories/orders.py): the only code that touches
+  Mongo. get/list_recent call get_db()[ORDERS] and _to_order_dict
+  (repositories/orders.py:6-9) translates Mongo's _id back to order_id.
+  - DB layer (app/db.py): get_client (db.py:17-26) lazily constructs either an
+  in-memory AsyncMongoMockClient (when MONGO_URL starts with mongomock://) or a
+  real AsyncIOMotorClient. Laziness lets tests set env before any connection.
+
+  Existing endpoints (confirmed, all read-only): GET /health, GET /orders, GET 
+  /orders/{order_id}. The two mutating endpoints in the brief — POST 
+  /orders/{order_id}/apply-discount and POST /webhooks/payment — do not exist 
+  yet (confirmed via grep; only referenced in docstrings/README).
+
+  2. Order schema & persistence
+
+  Confirmed. Wire/storage models in app/models.py, all money as integer paise:
+
+  - Order (models.py:15-24): order_id, partner_id, items: list[OrderItem],
+  subtotal_paise, total_paise, currency="INR", status (free-form str),
+  created_at. Note status is an unconstrained string, and there is no discount 
+  or payment field on the model yet.
+  - OrderItem (models.py:8-12): sku, name, unit_price_paise (ge=0), quantity 
+  (ge=1).
+  - DiscountCode (models.py:26-40): code, percent_off_bps (gt=0, le=10000),
+  cap_paise (gt=0), expires_at, partner_share_bps + rayy_share_bps (each ge=0, 
+  le=10000, documented to sum to 10000).
+
+  Persistence (confirmed): app/seed.py loads seed/orders.json, renaming order_id
+  → _id (seed.py:22) and upserting via replace_one(..., upsert=True)
+  (seed.py:32) — idempotent re-seed. Seed orders (seed/orders.json) all start
+  status: "pending" with total_paise == subtotal_paise. A seeded invariant is
+  even tested: test_seed_subtotals_match_items (tests/test_orders.py:35-39).
+
+  Assumption: the discount result the client expects is discount: null | { code,
+  amount_paise } (from client/web/src/types.ts:7) and applying a discount
+  should reduce total_paise. The brief says "record what was applied," but the
+  exact persisted shape (where partner/RAYY split is stored) is not dictated by
+  code — this is a design decision.
+
+  3. Payment gateway stub & failure modes
+
+  Confirmed. app/gateway.py — StubGateway never makes network calls.
+
+  - create_payment (gateway.py:40-48): returns a dict with a random payment_id
+  (secrets.token_hex); raises TypeError if amount_paise is not an int
+  (gateway.py:41-42) — a deliberate failure mode guarding against float money.
+  - webhook_body (gateway.py:50-57): canonical JSON with compact separators
+  (",", ":"). Signature correctness depends on signing the exact raw bytes —
+  re-serializing on the receiving side would break HMAC verification.
+  - sign (gateway.py:59-60): HMAC-SHA256(secret, body).hexdigest(), sent in
+  header X-Gateway-Signature (SIGNATURE_HEADER, gateway.py:33).
+  - deliveries (gateway.py:62-66): always returns the same event twice — the
+  stub's way of forcing you to handle at-least-once delivery / duplicate 
+  webhooks.
+
+  Documented failure modes (confirmed from docstring gateway.py:21-23 + 
+  fixtures): duplicate delivery (same payment_id, sometimes seconds apart).
+  Implied modes the handler must reject: bad/missing signature, unknown
+  order_id, and amount_paise mismatch against the order total (the brief calls
+  it "treat this as a production payment path").
+
+  4. Test structure & how to run
+
+  Confirmed. pytest.ini: testpaths = tests, asyncio_mode = auto (so bare async 
+  def test_* works, no decorator), session-scoped loops.
+
+  - tests/conftest.py: forces MONGO_URL=mongomock:// + test DB/secret via
+  setdefault (conftest.py:4-6) before importing the app. Two fixtures: db wipes
+  all collections and re-seeds per test (conftest.py:16-22); client wraps the
+  app in an ASGI AsyncClient (conftest.py:25-28) — no live server/network.
+  - tests/test_orders.py: health, get/list/404, seed-invariant checks.
+  - tests/test_gateway.py: signature + double-delivery
+  (test_webhook_is_signed_and_delivered_twice), the non-int TypeError guard, and
+  discount-code loading/split-sum invariant.
+
+  Run:
+  make test                                   # mongomock, no Docker (CI 
+  default)
+  make test-mongo                             # real replica set (transactions 
+  work)
+  python -m pytest tests/test_orders.py::test_get_seeded_order   # single test
+  (Standalone pytest needs MONGO_URL=mongomock://localhost in the env, which
+  make test sets.)
+
+  5. Abstractions to reuse (don't reinvent)
+
+  Confirmed, reuse these:
+  - The layer split. New work: add apply_discount / payment logic in
+  app/services/orders.py (or a new services/payments.py), DB writes in
+  app/repositories/orders.py (or a new repo), and keep routes thin in app/api/.
+  The README explicitly grades on keeping money logic out of handlers.
+  - StubGateway.sign / SIGNATURE_HEADER (gateway.py:59-60,33) for webhook
+  verification — compute HMAC over the raw request body and compare with
+  hmac.compare_digest.
+  - discount_codes.get_by_code (repositories/discount_codes.py:32-33) for
+  lookup; it already returns a validated DiscountCode or None.
+  - Domain-exception → HTTP pattern (OrderNotFound → 404). Add parallel
+  exceptions (e.g. CodeNotFound, CodeExpired, OrderAlreadyPaid, AmountMismatch)
+  and map them in the route.
+  - get_db() + ORDERS constant (db.py:12,29) and _to_order_dict for the id
+  translation.
+  - seed/fixtures.json — the grader's scenarios; use them to shape tests (see
+  risks below).
+
+  6. Risks
+
+  Duplicate payment webhooks (confirmed risk). deliveries() always fires twice
+  (gateway.py:62-66) and fixtures.json webhook_1 has times_delivered: 2. Without
+  idempotency the order could be marked paid twice / a payment recorded twice.
+  Mitigation: dedupe on payment_id — e.g. a unique-indexed payments record or a
+  conditional update (update_one filtered on status != "paid"), so the second
+  delivery is a no-op.
+
+  Concurrent discount application (confirmed-as-tested). fixtures.json apply_4
+  sends two codes to ord_c_3005 "at_the_same_time" and apply_5 sends two
+  "one_after_another" to ord_c_3004. A naive read-modify-write can double-apply
+  or lose an update. Mitigation: an atomic conditional update (apply only if no
+  discount present) or a transaction — but note the mongomock caveat.
+
+  Monetary precision (confirmed constraint, unspecified rule). All money is
+  integer paise; create_payment rejects floats (gateway.py:41). A
+  percent_off_bps × subtotal computation produces fractions of a paise — the
+  rounding rule is deliberately unspecified (README §"Two things"). Compute with
+  integer math (subtotal * bps // 10000, then min(cap_paise, …)), pick a
+  rounding direction, and document it. SUPER60 (6000 bps, cap_paise: 4000) is a
+  seeded case where the cap binds — a good test.
+
+  Settlement accuracy (confirmed design requirement). Partners settle monthly on
+  their share, and a partner's split ratio can change next month (README §5).
+  Risk: storing only a code reference and recomputing at settlement time would
+  use next month's ratio and mis-settle. Mitigation: snapshot
+  partner_share_bps/rayy_share_bps and the discount amount onto the order at 
+  apply time, so the monthly query reads the historical split, not the current
+  code config. The split can't be derived later because discount_codes is
+  mutable config loaded from JSON.
+
+  Secondary (confirmed): expires_at is relative (discount_codes.py:26, PAST30
+  has expires_in_days: -1) — an expired code must be rejected. status is an
+  unconstrained string (models.py:22) — be consistent ("pending"/"paid").
+  Verifying the signature requires the raw bytes (await request.body()), not a
+  re-serialized model.
+
+  Assumption: the webhook should also validate amount_paise equals the order's
+  payable total before marking paid; the brief implies it ("production payment
+  path") but no code asserts it.
+
+  7. mongomock transaction caveat
+
+  Confirmed. make test uses mongomock, which does not support transactions
+  (README; db.py:20-24). If you solve concurrency/idempotency with
+  multi-document transactions, they only run under make test-mongo/compose — and
+  the README asks you to note that in NOTES.md. Prefer single-document atomic
+  updates (update_one with a filter condition) where possible, since those work
+  under both.
+
+  ---
+  Implementation plan
+
+  1. Discount math helper (pure, testable) in a service module:
+  compute_discount(subtotal_paise, code) → amount_paise using integer math,
+  applying cap_paise and a documented rounding rule. Reject expired codes.
+  2. Extend the Order model / persisted doc with a discount snapshot: code,
+  amount_paise, partner_share_bps, rayy_share_bps, and recomputed total_paise.
+  Add a payment record + status transition.
+  3. Service: apply_discount(order_id, code) — load order, look up code via
+  discount_codes.get_by_code, compute, persist with an atomic conditional update
+  (reject/define behaviour if a discount already exists — second unspecified
+  decision). New domain exceptions.
+  4. Service: handle_payment_webhook(raw_body, signature) — verify HMAC with
+  StubGateway.sign + compare_digest; parse; look up order; validate amount; mark
+  paid idempotently keyed on payment_id.
+  5. Routes in app/api/ (new payments/webhooks router or extend orders): thin,
+  read raw body for the webhook, map exceptions to status codes.
+  6. Tests mirroring fixtures.json: cap-binding (SUPER60), expiry (PAST30),
+  double-delivery idempotency (webhook_1), concurrent + sequential double-apply
+  (apply_4/apply_5), amount mismatch, bad signature.
+  7. Client (React or Flutter): implement formatPaise (integer-only Indian
+  grouping, throws on invalid) + OrderSummary per the doc-comment contract, with
+  tests.
+  8. NOTES.md (required) + prompts/ (required): rounding decision, second-code
+  decision, transactions-used flag, settlement answer, AI-caught mistake, time
+  spent.
+
+  Unanswered questions
+
+  1. Rounding of fractional paise — round down (floor), half-up, or banker's?
+  (Must decide + document.)
+  2. Second discount code on an already-discounted order — reject (409),
+  replace, or stack? (Must decide + document.)
+  3. Discount vs. subtotal — does the discount apply to subtotal_paise? Can an
+  order already paid still accept a discount? (Assume: no.)
+  4. Webhook amount validation — must amount_paise equal total_paise exactly,
+  and what status for a mismatch (reject vs. record-and-flag)?
+  5. Signature failure response — 400 vs 401, and should it be silent to avoid
+  leaking? What about unknown order_id in a webhook (ack 200 to stop retries, or
+  404)?
+  6. Persisted status vocabulary — confirm just pending/paid, or is a
+  failed/discounted state expected?
+  7. Idempotency key — dedupe on payment_id alone, sufficient given the stub
+  reuses it across deliveries? (Appears yes from fixtures.json.)
+
+  Want me to proceed with this plan (starting with the discount helper + service
+  and their tests), or adjust any of the decisions in the open-questions list
+  first?
+
+✻ Sautéed for 1m 20s
+
+> /model 
+  ⎿  Kept model as Opus 4.8 (1M context)
+
+> For each requirement, provide:                                                
+                                                                                
+  Expected behaviour                                                            
+  Relevant data                                                                 
+  Validation rules                                                              
+  Failure cases                                                                 
+  Expected HTTP response                                                        
+  Test scenario                                                                 
+                                                                                
+  Pay special attention to:                                                     
+                                                                                
+  Expired and unknown discount codes.                                           
+  Percentage discounts exceeding the cap.                                       
+  Partner and platform funding allocation.                                      
+  Rounding fractional paise.                                                    
+  Applying a second discount.                                                   
+  Duplicate payment webhooks.                                                   
+  Payment amount mismatches.                                                    
+  Payment failures and retries.                                                 
+  Orders that are already paid.                                                 
+  Concurrent requests.                                                          
+                                                                                
+  Do not implement anything. Identify which behaviours are specified and which  
+  require an explicit design decision.                                          
+
+● No implementation — this is a behavioural specification. I'll organize it
+  around the two endpoints, cover each special-attention concern as a
+  sub-requirement, and tag everything [SPECIFIED] (dictated by
+  README/code/fixtures) or [DESIGN DECISION] (left to you, must document in
+  NOTES.md).
+
+  Legend: S = specified · D = design decision · I = implied-but-not-asserted
+  (reasonable inference, worth confirming).
+
+  ---
+  A. POST /orders/{order_id}/apply-discount
+
+  Body: { "code": "..." } (S, README §1).
+
+  A1. Happy-path application
+
+  - Expected behaviour — Look up the order and the code; compute the discount on
+  subtotal_paise; reduce total_paise; record what was applied (code, amount,
+  funding split). [S] that it's applied and recorded; [D] the exact persisted
+  shape.
+  - Relevant data — order.subtotal_paise, DiscountCode.percent_off_bps,
+  cap_paise, partner_share_bps, rayy_share_bps, expires_at
+  (app/models.py:26-40); lookup via discount_codes.get_by_code
+  (app/repositories/discount_codes.py:32).
+  - Validation rules — code exists; not expired; order exists; [D] order not
+  already paid; [D] no existing discount (see A6).
+  - Failure cases — unknown code; expired code; order not found; already
+  discounted; already paid.
+  - HTTP — 200 with updated order (I shape).
+  - Test — fixtures.json apply_1 (SUPER60 on ord_c_3002), apply_2 (KIDS18 on
+  ord_c_3001): assert total_paise drops by the computed amount and the split is
+  snapshotted.
+
+  A2. Unknown discount code  ⭐
+
+  - Expected behaviour — reject; no mutation. [S] (must look the code up).
+  get_by_code returns None (discount_codes.py:32-33), already covered by
+  test_discount_codes.get_by_code("NOT_A_CODE") is None
+  (tests/test_gateway.py:38).
+  - Validation — get_by_code(code) is not None.
+  - HTTP — [D] 404 ("code not found") vs 422. Recommend 404.
+  - Test — POST a nonsense code → error status, order unchanged.
+
+  A3. Expired discount code  ⭐
+
+  - Expected behaviour — reject; no mutation. [S] that codes have an expiry and
+  PAST30 exists with expires_in_days: -1 (seed/discount_codes.json:19-26) —
+  clearly a seeded "expired" fixture. fixtures.json apply_3 applies PAST30 to
+  ord_c_3002.
+  - Relevant data — expires_at is computed at load as now + 
+  timedelta(days=expires_in_days) (discount_codes.py:25-28), so PAST30 is always
+  in the past. Compare against datetime.now(timezone.utc).
+  - Validation — now < code.expires_at.
+  - Failure/HTTP — [D] 409/422/400 ("code expired"). Expiry check is [S]; the
+  status is [D].
+  - Test — apply_3: PAST30 → rejected, order untouched. Watch tz-awareness
+  (expires_at is tz-aware; a naive datetime.now() comparison raises).
+
+  A4. Percentage exceeding the cap  ⭐
+
+  - Expected behaviour — discount = min(percentage_of_subtotal, cap_paise). [S]
+  README §1 ("a cap in paise"); cap_paise field gt=0 (models.py:38).
+  - Relevant data — SUPER60: 6000 bps, cap_paise: 4000
+  (discount_codes.json:14-18) — on ord_c_3002 (14999) raw 60% ≈ 8999, so the cap
+  binds at 4000. KIDS18 (1800 bps, cap 80000) on 14999 ≈ 2700 — cap does not
+  bind.
+  - Validation — computed amount never exceeds cap_paise; never exceeds
+  subtotal_paise.
+  - Failure cases — none (cap is a clamp, not an error).
+  - HTTP — 200.
+  - Test — apply_1 (SUPER60→ord_c_3002): assert discount == 4000 (cap),
+  not 8999. Plus a non-binding case (KIDS18).
+
+  A5. Partner / platform funding allocation  ⭐
+
+  - Expected behaviour — record each party's share of the discount so monthly
+  settlement is correct even after the code's split changes next month. [S] that
+  the split exists and sums to 10000 (models.py:38-40,
+  tests/test_gateway.py:37); [S] the settlement requirement (README §5). [D]
+  what you store per order and what the settlement query reads — README §5
+  explicitly asks you to decide and write it in NOTES.md.
+  - Relevant data — partner_share_bps, rayy_share_bps, discount amount_paise,
+  partner_id (models.py:17), created_at (for the monthly window).
+  - Validation — partner_share_bps + rayy_share_bps == 10000 (invariant, already
+  tested); partner_amount + rayy_amount == discount_amount (watch rounding —
+  see A7: allocate one side, derive the other to avoid a lost/extra paise).
+  - Failure cases — storing only a code reference and recomputing later → wrong
+  settlement after a ratio change (the core trap).
+  - HTTP — n/a (storage concern).
+  - Test — apply a code, assert the order persists the split snapshot;
+  conceptually, a settlement sum over partner_id for the month equals Σ
+  partner_amount. [D] whether to also unit-test the allocation split.
+
+  A6. Applying a second discount  ⭐
+
+  - Expected behaviour — [D] — README §"Two things deliberately not specified":
+  "what happens when a second discount code is applied to an order that already 
+  has one." Options: reject (idempotent-ish 409), replace, or stack. Must pick +
+  document.
+  - Relevant data — presence of an existing discount on the order.
+  - Validation — detect an already-discounted order.
+  - Failure/HTTP — [D] e.g. 409 Conflict if you reject.
+  - Test — fixtures.json apply_5 (KIDS18 then FIRST5 on ord_c_3004, "sent": 
+  "one_after_another") tests the sequential second-code path; apply_4 (same
+  codes, "at_the_same_time" on ord_c_3005) tests it concurrently (see A8). Your
+  chosen policy must hold under both.
+
+  A7. Rounding fractional paise  ⭐
+
+  - Expected behaviour — [D] — README §"Two things deliberately not specified":
+  the rounding rule when a percentage yields a fraction of a paise. Must pick
+  (floor / half-up / banker's) + document.
+  - Relevant data — subtotal_paise * percent_off_bps is an integer; / 10000 is
+  where the fraction appears. Use integer math (e.g. (subtotal * bps) // 10000
+  for floor).
+  - Validation — result is int; all money stays integer paise (the codebase
+  rule; create_payment rejects floats, gateway.py:41). Also decide rounding for
+  the partner/RAYY split of the discount (A5) consistently.
+  - Failure cases — float arithmetic (precision drift); split halves that don't
+  re-sum to the total.
+  - HTTP — 200.
+  - Test — pick a subtotal × bps that isn't divisible by 10000 and assert the
+  exact expected paise under your chosen rule. (All current seed amounts should
+  be checked for which ones are fractional.)
+
+  A8. Concurrent discount requests  ⭐
+
+  - Expected behaviour — two simultaneous applies must not both win /
+  double-apply / lose an update; the A6 policy must hold atomically. [S] that
+  it's tested (apply_4, "sent": "at_the_same_time", fixtures.json:26-33); [D]
+  the mechanism.
+  - Relevant data — the order doc's discount field as a guard.
+  - Validation — atomic conditional write: update_one({_id, discount: None}, 
+  {...}) and check modified_count, or a transaction.
+  - Failure cases — read-modify-write race → two discounts applied, or one
+  silently overwritten.
+  - HTTP — one 200, the other per your A6 policy (409).
+  - Test — apply_4: fire both concurrently; assert exactly one applied and
+  total_paise reflects a single discount. Caveat: mongomock (make test) has no 
+  transactions (README; app/db.py:20-24); prefer single-doc atomic updates so
+  the guarantee holds under both make test and make test-mongo. If you use
+  transactions, note it in NOTES.md.
+
+  ---
+  B. POST /webhooks/payment
+
+  Body shape (S, app/gateway.py:7-19): { event, payment_id, order_id, 
+  amount_paise }. Signature: HMAC-SHA256 hex of the raw body in header
+  X-Gateway-Signature (SIGNATURE_HEADER, gateway.py:33), keyed by
+  GATEWAY_WEBHOOK_SECRET.
+
+  B1. Signature verification
+
+  - Expected behaviour — verify HMAC over the raw request bytes before trusting
+  the body; reject if absent/invalid. [S] (gateway docstring; "treat as a
+  production payment path"). Reuse StubGateway.sign (gateway.py:59-60); compare
+  with hmac.compare_digest.
+  - Relevant data — raw await request.body() (not a re-serialized model —
+  re-serialization breaks the HMAC, because the body uses compact separators
+  (",",":"), gateway.py:57), header value, secret.
+  - Validation — compare_digest(sign(raw), header).
+  - Failure cases — missing header; wrong/tampered signature; body re-encoded
+  before hashing.
+  - HTTP — [D] 401 vs 400 on bad signature. Recommend 401.
+  - Test — valid signature → accepted; mutated body or wrong secret → rejected,
+  no state change. (Existing test_webhook_is_signed_and_delivered_twice,
+  tests/test_gateway.py:11-25, shows how to build a signed delivery.)
+
+  B2. Mark order paid + record payment (happy path)
+
+  - Expected behaviour — on valid payment.succeeded, set order status = "paid"
+  and record the payment (payment_id, amount). [S] README §2.
+  - Relevant data — order_id, payment_id, amount_paise; order
+  total_paise/status.
+  - Validation — order exists; [D/I] amount matches (B7); status transition
+  valid (B9).
+  - HTTP — 200 (ack).
+  - Test — fixtures.json webhook_2 (pay_c_9002 → ord_c_3001, after apply_2,
+  times_delivered: 1): order becomes paid, payment recorded; amount should equal
+  the discounted total from apply_2.
+
+  B3. Duplicate payment webhooks (idempotency)  ⭐
+
+  - Expected behaviour — processing the same event twice has the same effect as
+  once: one state change, one recorded payment. [S] — delivery is at-least-once;
+  deliveries() returns the event twice (gateway.py:62-66); fixtures.json
+  webhook_1 has times_delivered: 2.
+  - Relevant data — payment_id as the idempotency key.
+  - Validation — dedupe on payment_id — unique index on a payments collection,
+  or conditional update {_id, status: {$ne: "paid"}} checking modified_count.
+  - Failure cases — double-marking paid; two payment records; double-counting
+  revenue.
+  - HTTP — both deliveries → 200 (second is a no-op ack; returning non-2xx would
+  trigger more gateway retries).
+  - Test — webhook_1: deliver pay_c_9001→ord_c_3003 twice; assert single payment
+  record, paid once, idempotent.
+
+  B4. Payment amount mismatch  ⭐
+
+  - Expected behaviour — [I/D] — amount_paise is documented as "what the
+  customer was actually charged" (gateway.py:17). Production path implies
+  verifying it equals the order's payable total_paise. Not asserted in code, so
+  the rule and the response are a design decision.
+  - Relevant data — webhook amount_paise vs order total_paise (post-discount).
+  - Validation — amount_paise == order.total_paise.
+  - Failure cases — underpayment/overpayment; stale amount (webhook arrived
+  before a discount was applied — note webhook_2 is explicitly ordered after: 
+  [apply_2]).
+  - HTTP — [D] 409/422 on mismatch, or accept-and-flag. Recommend reject (409),
+  don't mark paid.
+  - Test — signed webhook with wrong amount_paise → rejected, order stays
+  pending.
+
+  B5. Payment failures and retries  ⭐
+
+  - Expected behaviour — the stub only models payment.succeeded (S,
+  gateway.py:51-52); there is no payment.failed event server-side. "Payment
+  failure + retry" is primarily a client requirement: on onPay rejection show an
+  error (role="alert" in React / text "Payment failed" in Flutter) and
+  re-enable the button (client/web/src/OrderSummary.tsx:10-12,
+  client/flutter/lib/order_summary.dart:14-17). [S] on the client; [D/I] whether
+  the server handles any non-success event (likely out of scope).
+  - Relevant data — order.status ("paid" locks the button; "pending" allows
+  retry).
+  - Validation (client) — button disabled while pending (still reads "Pay");
+  reads "Paid" & disabled only when status === "paid".
+  - Failure cases — retry after a failure must not be blocked; a successful
+  retry still must be idempotent server-side (B3).
+  - HTTP — n/a (client).
+  - Test — client test: onPay rejects → alert shown, button re-enabled; second
+  attempt allowed.
+
+  B6. Order already paid  ⭐
+
+  - Expected behaviour — a webhook for an already-paid order (new or duplicate
+  payment_id) must not re-apply. [S] via the idempotency requirement; overlaps
+  B3. [D] whether a different payment_id on a paid order is an error or a benign
+  no-op.
+  - Validation — status guard in the conditional update (status != "paid").
+  - Failure/HTTP — duplicate payment_id → 200 no-op; conflicting new payment on
+  paid order → [D] 200 ignore vs 409.
+  - Test — pre-set ord_x to paid, deliver a webhook → no change; assert single
+  payment of record.
+
+  B7. Unknown order in webhook
+
+  - Expected behaviour — [D] — webhook references a nonexistent order_id. Ack
+  200 (stop retries for an un-actionable event) vs 404/422.
+  - Validation — order lookup returns None.
+  - HTTP — [D]; recommend 404 for a clearly bad reference (or 200-ack if you
+  prefer not to leak existence). Document the choice.
+  - Test — signed webhook with order_id: "ord_missing" → chosen status, no
+  writes.
+
+  B8. Concurrent webhook deliveries  ⭐
+
+  - Expected behaviour — two near-simultaneous deliveries of the same payment_id
+  (the real gateway sends "sometimes seconds apart", gateway.py:22) must still
+  net one effect. Same mechanism as B3, under concurrency.
+  - Validation — unique index on payment_id (second insert raises
+  DuplicateKeyError → caught → no-op) is race-safe even without transactions; a
+  check-then-write is not.
+  - HTTP — both 200.
+  - Test — fire webhook_1's two deliveries concurrently; assert exactly one
+  payment.
+
+  ---
+  Summary: specified vs. design-decision
+
+  Specified (no latitude):
+  - Discount looked up, applied, recorded; cap clamps the percentage (A1, A4).
+  - Expiry must be enforced; PAST30 is the expired fixture (A3).
+  - Unknown code rejected (A2).
+  - Split exists and sums to 10000 (A5 invariant).
+  - Webhook body shape + HMAC-SHA256-over-raw-body verification (B1).
+  - Mark paid + record payment (B2).
+  - Idempotency for at-least-once double delivery (B3, B8).
+  - Integer paise everywhere; no float money (A7 constraint, gateway.py:41).
+  - Client button states + error-on-failure + retry (B5).
+
+  Design decisions (must decide + write in NOTES.md):
+  - Rounding rule for fractional paise, incl. the split allocation (A7, A5). ⭐
+  README-flagged.
+  - Second-discount policy: reject / replace / stack (A6). ⭐ README-flagged.
+  - What's stored per order for settlement & what the settlement query reads
+  (A5). ⭐ README-asked.
+  - Concurrency mechanism: single-doc atomic update vs transaction (A8, B8) —
+  plus the mongomock-no-transactions note.
+  - HTTP status codes for: unknown code, expired code, second discount, bad
+  signature, amount mismatch, unknown order, paid-order conflict (A2, A3, A6,
+  B1, B4, B6, B7).
+  - Whether the webhook validates amount against total_paise and the mismatch
+  response (B4).
+  - Whether a discount can be applied to a paid order (A1).
+
+  Out of scope / not modelled: server-side payment.failed events — the stub
+  emits only payment.succeeded; failure/retry lives in the client (B5).
+
+  Want me to turn the design decisions into a short decision table (recommended
+  choice + one-line rationale per row) that could drop straight into NOTES.md?
+
+✻ Cooked for 1m 28s
+
+> /plan Unknown order/code: 404 Not Found                                       
+Expired discount: 400 Bad Request                                               
+Already-paid order / second discount: 409 Conflict                              
+Rounding: use integer paise and round half-up.                                  
+Discount cap: min(calculated_discount, cap_paise).                              
+Funding split: store the actual partner/RAYY amounts and the split used at the  
+time of application.                                                            
+Second discount: reject; do not replace or stack.                               
+Concurrent discount requests: only one should succeed; use an atomic update.    
+Invalid webhook signature: 401 Unauthorized                                     
+Payment amount mismatch: 400 Bad Request                                        
+Duplicate webhook: idempotent; return 200 with no duplicate payment.            
+Unknown webhook order: 404 Not Found.                                           
+                                                                                
+Please implement using these decisions, keep the solution simple, and follow    
+the existing repository structure.                                              
+  ⎿  Enabled plan mode
+
+● I've already read the full codebase in earlier turns. Your decisions are clear
+  and complete for the backend. Let me lay out the implementation plan.
+
+  A couple of things worth flagging up front that shaped the plan:
+
+  - Amount-match target: the webhook's amount_paise will be validated against
+  the order's post-discount total_paise (what the customer is actually charged,
+  per gateway.py:17). Note this means seed/fixtures.json's webhook_2 (amount
+  14999 arriving after apply_2 discounts ord_c_3001 to 12299) would be a 400 
+  mismatch under your rules — fixtures are "scenarios you can use," not
+  must-pass tests, so my tests will build correctly-priced webhooks. I'll
+  document this.
+  - Concurrency without transactions: make test uses mongomock, which has no
+  transactions. So I'll enforce single-winner guarantees with single-document 
+  atomic conditional updates (update_one with a state guard + modified_count
+  check), which hold under both make test and make test-mongo. No transactions
+  needed → nothing to caveat on that front.
+  - Scope: these decisions are all backend. The client (formatPaise,
+  OrderSummary) and prompts/ are separate required deliverables — I've listed
+  them as explicit next steps not covered by this plan.
+
+● I have complete codebase understanding from earlier exploration and the design
+  decisions are fully specified, so I'll write the plan directly.
+● Updated plan
+  ⎿  /plan to preview
+
+● The plan is written. One scoping question before I finalize, since it changes
+  what gets built in this pass.
+
+● User answered Claude's questions:
+  ⎿  · Your decisions cover the backend (discounts + webhook). The client 
+     (formatPaise + OrderSummary) and prompts/ are also required deliverables. 
+     What should this implementation pass include? → Backend only
+
+● Backend only — which matches the plan as written (client and prompts/ are
+  already listed as out-of-scope follow-ups). The plan is complete and
+  finalized.
+
+● User approved Claude's plan
+  ⎿  Plan saved to: ~\.claude\plans\buzzing-conjuring-moon.md · /plan to edit
+     Plan: Partner discounts + payment webhook
+
+     Context
+
+     The RAYY service (app/) currently exposes only read endpoints (GET /orders,
+     GET /orders/{id}, GET /health). Two mutating endpoints from README.md are
+     unbuilt: applying partner discount codes to an order, and processing
+     payment-gateway webhooks. This plan implements both in the existing
+     api → services → repositories layering, keeping all money logic out of
+     route
+     handlers (the README grades on this).
+
+     Design decisions (from the user, to be recorded in NOTES.md):
+
+     ┌──────────────────────────────────┬──────────────────────────────────────┐
+     │               Case               │              Behaviour               │
+     ├──────────────────────────────────┼──────────────────────────────────────┤
+     │ Unknown order / unknown code /   │ 404                                  │
+     │ unknown webhook order            │                                      │
+     ├──────────────────────────────────┼──────────────────────────────────────┤
+     │ Expired discount code            │ 400                                  │
+     ├──────────────────────────────────┼──────────────────────────────────────┤
+     │ Already-paid order / second      │ 409                                  │
+     │ discount on a discounted order   │                                      │
+     ├──────────────────────────────────┼──────────────────────────────────────┤
+     │ Invalid/missing webhook          │ 401                                  │
+     │ signature                        │                                      │
+     ├──────────────────────────────────┼──────────────────────────────────────┤
+     │ Payment amount mismatch          │ 400                                  │
+     ├──────────────────────────────────┼──────────────────────────────────────┤
+     │ Rounding fractional paise        │ integer math, round half-up          │
+     ├──────────────────────────────────┼──────────────────────────────────────┤
+     │ Discount cap                     │ min(calculated, cap_paise)           │
+     ├──────────────────────────────────┼──────────────────────────────────────┤
+     │ Funding split                    │ store actual partner/RAYY amounts +  │
+     │                                  │ the split bps used at apply time     │
+     ├──────────────────────────────────┼──────────────────────────────────────┤
+     │ Second discount                  │ reject (no replace, no stack)        │
+     ├──────────────────────────────────┼──────────────────────────────────────┤
+     │ Concurrency                      │ single-winner via atomic conditional │
+     │                                  │  update (modified_count)             │
+     ├──────────────────────────────────┼──────────────────────────────────────┤
+     │ Duplicate webhook                │ idempotent, 200, no duplicate        │
+     │                                  │ payment                              │
+     └──────────────────────────────────┴──────────────────────────────────────┘
+
+     Note: webhook amount_paise is validated against the order's post-discount
+     total_paise (what the customer is charged, per app/gateway.py:17).
+     Consequently seed/fixtures.json webhook_2 (amount 14999 after apply_2
+     discounts ord_c_3001) would be a 400 under these rules — fixtures are
+     reference
+     scenarios, not must-pass tests; tests will build correctly-priced webhooks.
+
+     Money logic (pure, reused everywhere)
+
+     New app/services/pricing.py — pure integer functions, no I/O:
+
+     - compute_discount(subtotal_paise, percent_off_bps, cap_paise) -> int
+       - raw = subtotal_paise * percent_off_bps (integer)
+       - half-up: discount = (raw + 5000) // 10000
+       - return min(discount, cap_paise)
+     - split_funding(discount_paise, partner_share_bps) -> (partner_amount, 
+     rayy_amount)
+       - partner = (discount_paise * partner_share_bps + 5000) // 10000
+       - rayy = discount_paise - partner (derive the complement so the two
+     always
+     re-sum to discount_paise — avoids a lost/extra paise)
+
+     Models (app/models.py)
+
+     - Add DiscountApplied(BaseModel): code, amount_paise, partner_share_bps,
+     rayy_share_bps, partner_amount_paise, rayy_amount_paise.
+     - Add PaymentRecord(BaseModel): payment_id, amount_paise.
+     - Extend Order: discount: DiscountApplied | None = None,
+     payment: PaymentRecord | None = None. (Serializes a superset of the
+     client's
+     types.ts discount: {code, amount_paise} — extra fields are fine.)
+
+     apply-discount
+
+     Service app/services/orders.py — add domain exceptions
+     (CodeNotFound, CodeExpired, OrderAlreadyPaid, DiscountAlreadyApplied,
+     reuse existing OrderNotFound) and apply_discount(order_id, code) -> Order:
+
+     1. load order → OrderNotFound if missing.
+     2. discount_codes.get_by_code(code) (app/repositories/discount_codes.py:32)
+     → CodeNotFound if None.
+     3. datetime.now(timezone.utc) >= code.expires_at → CodeExpired
+     (expires_at is tz-aware — use tz-aware now).
+     4. order.status == "paid" → OrderAlreadyPaid; order.discount is not None
+     → DiscountAlreadyApplied.
+     5. compute amount + split via pricing; build the discount doc;
+     new_total = subtotal_paise - amount.
+     6. atomic guard (repo): update_one({"_id": id, "status": {"$ne": "paid"}, 
+     "discount": None}, {"$set": {discount, total_paise}}). If modified_count ==
+     0
+     a concurrent writer won → raise DiscountAlreadyApplied (→ 409). This is the
+     real concurrency gate; {"discount": None} also matches the missing field on
+     freshly-seeded orders.
+     7. return the reloaded order.
+
+     Repository app/repositories/orders.py — add
+     set_discount(order_id, discount_doc, new_total) -> bool returning whether a
+     row
+     was modified.
+
+     Route app/api/orders.py — POST /orders/{order_id}/apply-discount with a
+     DiscountRequest(BaseModel){ code: str } body; map exceptions → 404/400/409;
+     return Order. Thin, no math.
+
+     payment webhook
+
+     Service app/services/payments.py — exceptions (BadSignature,
+     AmountMismatch, reuse OrderNotFound) and
+     process_webhook(raw_body: bytes, signature: str | None) -> None:
+
+     1. verify: StubGateway().sign(raw_body) (app/gateway.py:59) vs signature
+     with hmac.compare_digest; missing/invalid → BadSignature (→ 401).
+     2. json.loads(raw_body) → payment_id, order_id, amount_paise.
+     3. load order → OrderNotFound (→ 404).
+     4. amount_paise != order.total_paise → AmountMismatch (→ 400).
+     5. idempotent mark-paid (repo): update_one({"_id": id, "status": {"$ne": 
+     "paid"}}, {"$set": {"status": "paid", "payment": {...}}}).
+     modified_count == 1 = first delivery; 0 = already paid → no-op. Either way
+     return normally (→ 200). Single-doc update is the dedupe mechanism; no
+     second
+     payment is ever written.
+
+     Repository app/repositories/orders.py — add
+     mark_paid(order_id, payment_doc) -> bool.
+
+     Route app/api/webhooks.py (new router, prefix none) —
+     POST /webhooks/payment: read the raw body (await request.body() — not a
+     re-serialized model, or HMAC breaks) + X-Gateway-Signature header
+     (SIGNATURE_HEADER, app/gateway.py:33); call the service; map BadSignature
+     →401, OrderNotFound→404, AmountMismatch→400; return {"status": "ok"}.
+     Register in app/main.py alongside the existing routers.
+
+     Tests (mirror existing style — async, ASGI client, fixtures.json cases)
+
+     - tests/test_pricing.py — pure: half-up rounding boundaries (.5 up),
+     cap binds (SUPER60 6000bps/cap4000 on 14999 → 4000) vs non-binding
+     (KIDS18 on 14999 → 2700), split re-sums to the discount.
+     - tests/test_discounts.py — happy path (apply_1); unknown code →404;
+     expired PAST30 →400 (apply_3); already-paid →409; second discount →409
+     (apply_5 sequential); concurrent via asyncio.gather → exactly one 200, one
+     409 (apply_4); split snapshot persisted on the order.
+     - tests/test_webhooks.py — build a signed delivery with StubGateway
+     (as tests/test_gateway.py:11); happy path marks paid + records payment;
+     bad/missing signature →401; unknown order →404; amount mismatch →400;
+     double delivery (deliveries() returns it twice) → paid once, one payment,
+     both →200.
+
+     Deliverables doc
+
+     - NOTES.md — the decision table above; rounding rule; second-discount
+     policy;
+     settlement answer (store per-order partner/RAYY amounts + bps snapshot at
+     apply
+     time so a split-ratio change next month can't corrupt this month; the
+     monthly
+     settlement query sums discount.partner_amount_paise grouped by partner_id
+     over orders whose created_at / paid date falls in the month); "no
+     transactions used — single-doc atomic updates, so make test on mongomock
+     covers concurrency"; the webhook amount-vs-total_paise note; AI-caught
+     mistake; time spent.
+
+     Out of scope for this plan (separate required deliverables)
+
+     - Client: formatPaise + OrderSummary (React or Flutter) and their tests.
+     - prompts/ folder (user's AI prompt history export).
+
+     These are required for a passing submission but aren't covered by the
+     backend
+     decisions given; I'll tackle them next once the API is in.
+
+     Verification
+
+     make test                 # full suite on mongomock, incl. new tests + 
+     concurrency
+     python -m pytest tests/test_discounts.py tests/test_webhooks.py
+     tests/test_pricing.py
+     make test-mongo           # optional: same suite against the real replica 
+     set
+     make run                  # manual smoke: POST apply-discount, then a 
+     signed webhook twice
+
+     Existing tests (tests/test_orders.py, tests/test_gateway.py) must stay
+     green.
+
+● Plan approved. Let me set up task tracking and start implementing.
+
+● Starting with pricing.py and models (independent).
+
+● Write(app\services\pricing.py)
+  ⎿  Wrote 31 lines to app\services\pricing.py
+       1 """Pure money maths for discounts. Integer paise only, no I/O.
+       2 
+         ntage produces
+       4 (see NOTES.md). All inputs and outputs are integer paise / basis
+          points.
+       6 
+       7 
+       8 def _round_half_up(numerator: int, denominator: int) -> int:
+          maths only."""
+      10     return (numerator + denominator // 2) // denominator
+     … +32 lines (ctrl+o to expand)
+
+● Update(app\models.py)
+  ⎿  Added 25 lines
+      12      quantity: int = Field(ge=1)
+      13  
+      14  
+      15 +class DiscountApplied(BaseModel):                              
+      16 +    """A discount recorded on an order.                        
+      17 +                                                               
+      18 +    ``partner_amount_paise`` + ``rayy_amount_paise`` = ``amount
+         +_paise``. The                                                  
+      19 +    share bps are snapshotted at apply time so monthly settleme
+         +nt stays correct                                               
+      20 +    even if the code's split ratio changes later.              
+      21 +    """                                                        
+      22 +                                                               
+      23 +    code: str                                                  
+      24 +    amount_paise: int = Field(ge=0)                            
+      25 +    partner_share_bps: int = Field(ge=0, le=10000)             
+      26 +    rayy_share_bps: int = Field(ge=0, le=10000)                
+      27 +    partner_amount_paise: int = Field(ge=0)                    
+      28 +    rayy_amount_paise: int = Field(ge=0)                       
+      29 +                                                               
+      30 +                                                               
+      31 +class PaymentRecord(BaseModel):                                
+      32 +    """A successful payment recorded on an order."""           
+      33 +                                                               
+      34 +    payment_id: str                                            
+      35 +    amount_paise: int = Field(ge=0)                            
+      36 +                                                               
+      37 +                                                               
+      38  class Order(BaseModel):
+      39      order_id: str
+      40      partner_id: str
+     ...
+      44      currency: str = "INR"
+      45      status: str
+      46      created_at: datetime
+      47 +    discount: DiscountApplied | None = None                    
+      48 +    payment: PaymentRecord | None = None                       
+      49  
+      50  
+      51  class DiscountCode(BaseModel):
+
+● Now the repository additions (both set_discount and mark_paid since both touch
+  the orders repo):
+
+● Update(app\repositories\orders.py)  ⎿  Added 27 lines
+      17  async def list_recent(limit: int = 50) -> list[dict]:
+      18      cursor = get_db()[ORDERS].find({}).sort("created_at", -1).l
+          imit(limit)
+      19      return [_to_order_dict(doc) async for doc in cursor]
+      20 +                                                               
+      21 +                                                               
+      22 +async def set_discount(order_id: str, discount: dict, new_total
+         +_paise: int) -> bool:                                          
+      23 +    """Atomically attach a discount to an order that has none a
+         +nd is unpaid.                                                  
+      24 +                                                               
+      25 +    The filter is the concurrency gate: only one of several con
+         +current applies                                                
+      26 +    can match (``discount: None`` matches both a null field and
+         + a missing one).                                               
+      27 +    Returns whether a document was modified.                   
+      28 +    """                                                        
+      29 +    result = await get_db()[ORDERS].update_one(                
+      30 +        {"_id": order_id, "status": {"$ne": "paid"}, "discount"
+         +: None},                                                       
+      31 +        {"$set": {"discount": discount, "total_paise": new_tota
+         +l_paise}},                                                     
+      32 +    )                                                          
+      33 +    return result.modified_count == 1                          
+      34 +                                                               
+      35 +                                                               
+      36 +async def mark_paid(order_id: str, payment: dict) -> bool:     
+      37 +    """Atomically mark an unpaid order paid and record the paym
+         +ent.                                                           
+      38 +                                                               
+      39 +    The ``status != paid`` filter makes repeated webhook delive
+         +ries idempotent:                                               
+      40 +    only the first delivery modifies the order. Returns whether
+         + it did.                                                       
+      41 +    """                                                        
+      42 +    result = await get_db()[ORDERS].update_one(                
+      43 +        {"_id": order_id, "status": {"$ne": "paid"}},          
+      44 +        {"$set": {"status": "paid", "payment": payment}},      
+      45 +    )                                                          
+      46 +    return result.modified_count == 1                          
+
+● Now the service layer for discounts:
+
+● Update(app\services\orders.py)
+  ⎿  Added 63 lines
+       1  """Order business rules. No HTTP here; routes call into this mo
+          dule."""
+       2  
+       3 +from datetime import datetime, timezone                        
+       4 +                                                               
+       5  from app.models import Order
+       6 +from app.repositories import discount_codes as codes_repo      
+       7  from app.repositories import orders as orders_repo
+       8 +from app.services import pricing                               
+       9  
+      10  
+      11  class OrderNotFound(Exception):
+      12      pass
+      13  
+      14  
+      15 +class CodeNotFound(Exception):                                 
+      16 +    pass                                                       
+      17 +                                                               
+      18 +                                                               
+      19 +class CodeExpired(Exception):                                  
+      20 +    pass                                                       
+      21 +                                                               
+      22 +                                                               
+      23 +class OrderAlreadyPaid(Exception):                             
+      24 +    pass                                                       
+      25 +                                                               
+      26 +                                                               
+      27 +class DiscountAlreadyApplied(Exception):                       
+      28 +    pass                                                       
+      29 +                                                               
+      30 +                                                               
+      31  async def get_order(order_id: str) -> Order:
+      32      doc = await orders_repo.get(order_id)
+      33      if doc is None:
+     ...
+      37  
+      38  async def list_orders(limit: int = 50) -> list[Order]:
+      39      return [Order(**doc) for doc in await orders_repo.list_rece
+          nt(limit)]
+      40 +                                                               
+      41 +                                                               
+      42 +async def apply_discount(order_id: str, code: str) -> Order:   
+      43 +    """Apply a partner discount code to an order and record wha
+         +t was applied.                                                 
+      44 +                                                               
+      45 +    Rejects unknown/expired codes, already-paid orders, and a s
+         +econd discount.                                                
+      46 +    The persisted discount snapshots the funding split (amounts
+         + + bps) so a                                                   
+      47 +    later change to the code's split cannot corrupt settlement.
+      48 +    """                                                        
+      49 +    order = await get_order(order_id)                          
+      50 +                                                               
+      51 +    discount_code = codes_repo.get_by_code(code)               
+      52 +    if discount_code is None:                                  
+      53 +        raise CodeNotFound(code)                               
+      54 +    if datetime.now(timezone.utc) >= discount_code.expires_at: 
+      55 +        raise CodeExpired(code)                                
+      56 +                                                               
+      57 +    if order.status == "paid":                                 
+      58 +        raise OrderAlreadyPaid(order_id)                       
+      59 +    if order.discount is not None:                             
+      60 +        raise DiscountAlreadyApplied(order_id)                 
+      61 +                                                               
+      62 +    amount = pricing.compute_discount(                         
+      63 +        order.subtotal_paise, discount_code.percent_off_bps, di
+         +scount_code.cap_paise                                          
+      64 +    )                                                          
+      65 +    partner_amount, rayy_amount = pricing.split_funding(       
+      66 +        amount, discount_code.partner_share_bps                
+      67 +    )                                                          
+      68 +    discount = {                                               
+      69 +        "code": discount_code.code,                            
+      70 +        "amount_paise": amount,                                
+      71 +        "partner_share_bps": discount_code.partner_share_bps,  
+      72 +        "rayy_share_bps": discount_code.rayy_share_bps,        
+      73 +        "partner_amount_paise": partner_amount,                
+      74 +        "rayy_amount_paise": rayy_amount,                      
+      75 +    }                                                          
+      76 +    new_total = order.subtotal_paise - amount                  
+      77 +                                                               
+      78 +    # Atomic guard: loses to a concurrent apply (or a race that
+         + paid the order).                                              
+      79 +    if not await orders_repo.set_discount(order_id, discount, n
+         +ew_total):                                                     
+      80 +        raise DiscountAlreadyApplied(order_id)                 
+      81 +                                                               
+      82 +    return await get_order(order_id)                           
+
+● Now the apply-discount route:
+
+● Update(app\api\orders.py)
+  ⎿  Added 5 lines
+      1  from fastapi import APIRouter, HTTPException
+      2 +from pydantic import BaseModel                                  
+      3  
+      4  from app.models import Order
+      5  from app.services import orders as orders_service
+     ...
+       7  router = APIRouter(prefix="/orders", tags=["orders"])
+       8  
+       9  
+      10 +class DiscountRequest(BaseModel):                              
+      11 +    code: str                                                  
+      12 +                                                               
+      13 +                                                               
+      14  @router.get("", response_model=list[Order])
+      15  async def list_orders(limit: int = 50) -> list[Order]:
+      16      return await orders_service.list_orders(limit)
+
+● Update(app\api\orders.py)
+  ⎿  Added 16 lines
+      22          return await orders_service.get_order(order_id)
+      23      except orders_service.OrderNotFound:
+      24          raise HTTPException(status_code=404, detail="order not 
+          found")
+      25 +                                                               
+      26 +                                                               
+      27 +@router.post("/{order_id}/apply-discount", response_model=Order
+         +)                                                              
+      28 +async def apply_discount(order_id: str, body: DiscountRequest) 
+         +-> Order:                                                      
+      29 +    try:                                                       
+      30 +        return await orders_service.apply_discount(order_id, bo
+         +dy.code)                                                       
+      31 +    except orders_service.OrderNotFound:                       
+      32 +        raise HTTPException(status_code=404, detail="order not 
+         +found")                                                        
+      33 +    except orders_service.CodeNotFound:                        
+      34 +        raise HTTPException(status_code=404, detail="discount c
+         +ode not found")                                                
+      35 +    except orders_service.CodeExpired:                         
+      36 +        raise HTTPException(status_code=400, detail="discount c
+         +ode expired")                                                  
+      37 +    except orders_service.OrderAlreadyPaid:                    
+      38 +        raise HTTPException(status_code=409, detail="order alre
+         +ady paid")                                                     
+      39 +    except orders_service.DiscountAlreadyApplied:              
+      40 +        raise HTTPException(status_code=409, detail="discount a
+         +lready applied")                                               
+
+● Now the payments service and webhook route:
+
+● Write(app\services\payments.py)
+  ⎿  Wrote 47 lines to app\services\payments.py
+       1 """Payment webhook business rules. No HTTP here; the route calls
+          into this.
+       2 
+         p/gateway.py),
+       4 so processing must verify the signature and be idempotent.
+       5 """
+       6 
+       8 import json
+       9 
+      10 from app.gateway import StubGateway
+     … +45 lines (ctrl+o to expand)
+
+● Write(app\api\webhooks.py)
+  ⎿  Wrote 23 lines to app\api\webhooks.py
+       1 from fastapi import APIRouter, HTTPException, Request
+       2 
+       3 from app.gateway import SIGNATURE_HEADER
+       4 from app.services import payments
+       5 from app.services.orders import OrderNotFound
+       6 
+       7 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
+       8 
+       9 
+      10 @router.post("/payment")
+     … +17 lines (ctrl+o to expand)
+
+● Update(app\main.py)
+  ⎿  Added 2 lines, removed 1 line
+      1  from fastapi import FastAPI
+      2  
+      3 -from app.api import health, orders                              
+      3 +from app.api import health, orders, webhooks                    
+      4  
+      5  app = FastAPI(title="RAYY take-home")
+      6  
+      7  app.include_router(health.router)
+      8  app.include_router(orders.router)
+      9 +app.include_router(webhooks.router)                             
+
+● Now the tests. Let me verify a couple of computed values first, then write the
+  three test files.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All values confirmed. Writing the test files:
+
+● Write(tests\test_pricing.py)
+  ⎿  Wrote 32 lines to tests\test_pricing.py
+      1 """Pure money maths — no DB, no async."""
+      2 
+      3 from app.services import pricing
+      4 
+      5 
+      6 def test_percentage_rounds_half_up():
+      7     # 1 * 5000 / 10000 = 0.5 -> 1 ; 1 * 4999 / 10000 = 0.4999 -> 
+        0
+      8     assert pricing.compute_discount(1, 5000, 99999) == 1
+      9     assert pricing.compute_discount(1, 4999, 99999) == 0
+     … +22 lines (ctrl+o to expand)
+
+● Write(tests\test_discounts.py)
+  ⎿  Wrote 63 lines to tests\test_discounts.py
+       1 """POST /orders/{id}/apply-discount — fixtures mirror seed/fixtu
+       2 
+       3 import asyncio
+       4 
+       6 
+       7 
+         :
+       9     # apply_1: SUPER60 on ord_c_3002 (subtotal 14999). 60% is ca
+         pped at 4000.
+         unt", json={"code": "SUPER60"})
+     … +65 lines (ctrl+o to expand)
+
+● Write(tests\test_webhooks.py)
+  ⎿  Wrote 84 lines to tests\test_webhooks.py
+      1 """POST /webhooks/payment — signed, idempotent payment handling."
+        ""
+      2 
+      3 import json
+      4 
+      6 from app.gateway import SIGNATURE_HEADER, StubGateway
+      7 
+      8 GATEWAY = StubGateway(webhook_secret="whsec_test")  # matches con
+        ftest's env
+      9 
+     … +96 lines (ctrl+o to expand)
+
+● Now run the full suite:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Dependencies aren't installed in this interpreter. Let me check for a venv /
+  correct Python.
+
+  Ran 1 shell command (ctrl+o to expand)
+● No venv, deps missing. Let me install requirements.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Installed. Now run the suite:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All 27 pass (8 existing + 19 new). Now NOTES.md.
+
+● Write(NOTES.md)
+  ⎿  Wrote 111 lines to NOTES.md
+       1 # NOTES
+       2 
+       3 ## What's implemented
+       5 Backend only this pass:
+       6 
+       7 - `POST /orders/{order_id}/apply-discount` — look up the code, a
+         pply it, record
+       9 - `POST /webhooks/payment` — verify the HMAC signature, check th
+         e amount, mark
+      10   the order paid idempotently.
+     … +139 lines (ctrl+o to expand)
+
+● Backend is complete and the full suite passes. Let me do a final confirmation
+  run.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Backend done. All 27 tests green (8 existing + 19 new), no regressions.
+
+  What I built
+
+  Followed your decisions exactly, keeping the money logic out of the route
+  handlers and inside the existing api → services → repositories layering.
+
+  New files
+  - app/services/pricing.py — pure integer maths: compute_discount (half-up,
+  cap-clamped) and split_funding (partner rounded half-up, RAYY takes the
+  complement so they always re-sum).
+  - app/services/payments.py — webhook rules: HMAC verify over raw bytes, amount
+  check, idempotent mark-paid.
+  - app/api/webhooks.py — POST /webhooks/payment (reads raw body +
+  X-Gateway-Signature, maps errors).
+  - tests/test_pricing.py, tests/test_discounts.py, tests/test_webhooks.py — 19
+  tests covering every decision, modelled on seed/fixtures.json scenarios.
+  - NOTES.md — decision table, rounding/second-discount/settlement answers, the
+  transactions and amount-match notes.
+
+  Modified
+  - app/models.py — DiscountApplied + PaymentRecord; optional discount/payment
+  on Order.
+  - app/repositories/orders.py — set_discount and mark_paid, both
+  single-document atomic conditional updates.
+  - app/services/orders.py — domain exceptions + apply_discount.
+  - app/api/orders.py — the apply-discount route with exception→status mapping.
+  - app/main.py — registered the webhooks router.
+
+  Decisions as implemented
+  - Statuses: 404 unknown order/code, 400 expired/amount-mismatch, 409
+  already-paid/second-discount, 401 bad/missing signature.
+  - Half-up rounding; cap via min(calculated, cap_paise); funding split stored
+  as amounts + bps snapshot at apply time.
+  - Concurrency and idempotency via atomic conditional updates (modified_count)
+  — no transactions, so mongomock's make test fully covers both paths.
+
+  Two things to flag:
+  1. NOTES.md has three placeholders only you can fill: the AI-mistake you
+  caught, and time spent. The rest is complete.
+  2. Still outstanding for a passing submission (out of scope per your "backend
+  only" choice): the client (formatPaise + OrderSummary, React or Flutter) and
+  the prompts/ folder.
+
+  Want me to proceed with the client next, and if so — React or Flutter?
+
+✻ Crunched for 6m 18s
+
+> Before we start working on the client, thoroughly validate the current        
+  implementation.                                                               
+                                                                                
+  Run all backend tests.                                                        
+  Verify the implementation against the assignment requirements and the         
+  decisions we agreed on.                                                       
+  Test these cases:                                                             
+  valid discount                                                                
+  unknown code                                                                  
+  expired code                                                                  
+  discount cap                                                                  
+  fractional-paise rounding                                                     
+  partner/RAYY funding split                                                    
+  second discount                                                               
+  paid order                                                                    
+  concurrent discount requests                                                  
+  invalid webhook signature                                                     
+  payment amount mismatch                                                       
+  duplicate webhook                                                             
+  concurrent duplicate webhooks                                                 
+  Verify failed requests do not partially modify the order.                     
+  Check that all money calculations use integer paise.                          
+  Review the code for race conditions, incorrect assumptions, and unnecessary   
+  changes.                                                                      
+  Review the existing tests and identify any important missing test cases.      
+                                                                                
+  Do not change the implementation yet.                                         
+                                                                                
+  Give me:                                                                      
+                                                                                
+  test results                                                                  
+  issues found                                                                  
+  missing test coverage                                                         
+  any requirement that is not correctly implemented                             
+  whether the backend is ready for client development                           
+                                                                                
+  If you find issues, explain them clearly before making any fixes.             
+
+● I'll validate thoroughly without touching the implementation. Let me run the
+  suite, then drive the extra cases (especially concurrent duplicate webhooks
+  and partial-modification checks) through a throwaway script.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All 27 pass. Now the throwaway validation script for the cases not in the
+  suite (concurrent duplicate webhooks, partial-modification guarantees,
+  integration-level rounding, non-exact split).
+
+  Made 1 scratchpad edit +101, ran 2 shell commands (ctrl+o to expand)
+
+● All extra cases pass. Let me do a static review pass — check for float usage
+  and look closely at the webhook parse path.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Validation complete. No implementation changed. Here's the full report.
+
+  Test results
+
+  Committed suite: 27/27 passed (make test / mongomock), ~0.12s. Breakdown: 8
+  pre-existing + 19 new (5 pricing, 7 discounts, 7 webhooks).
+
+  Extra ad-hoc checks (throwaway script, all green):
+
+  ┌─────────────────────────────────────────┬───────────────────────────────┐
+  │                  Case                   │            Result             │
+  ├─────────────────────────────────────────┼───────────────────────────────┤
+  │ Concurrent duplicate webhooks (×5, same │ all 200, paid once, single    │
+  │  payment_id)                            │ payment ✓                     │
+  ├─────────────────────────────────────────┼───────────────────────────────┤
+  │ Expired code — no partial modification  │ order byte-identical          │
+  │                                         │ before/after ✓                │
+  ├─────────────────────────────────────────┼───────────────────────────────┤
+  │ Unknown code — no partial modification  │ unchanged ✓                   │
+  ├─────────────────────────────────────────┼───────────────────────────────┤
+  │ Amount mismatch — no partial            │ pending, no payment field ✓   │
+  │ modification                            │                               │
+  ├─────────────────────────────────────────┼───────────────────────────────┤
+  │ Bad signature — no partial modification │ pending, no payment field ✓   │
+  ├─────────────────────────────────────────┼───────────────────────────────┤
+  │ Rounding at endpoint (KIDS18 on 38997 → │ 7019, total 31978 ✓           │
+  │  7019.46)                               │                               │
+  ├─────────────────────────────────────────┼───────────────────────────────┤
+  │ Non-exact funding split (7019 @         │ 4913 + 2106 = 7019 ✓          │
+  │ 7000bps)                                │                               │
+  ├─────────────────────────────────────────┼───────────────────────────────┤
+  │ Full flow: apply then pay discounted    │ 200, paid, amount matches ✓   │
+  │ total                                   │                               │
+  ├─────────────────────────────────────────┼───────────────────────────────┤
+  │ Discount on an order paid via webhook   │ 409 ✓                         │
+  ├─────────────────────────────────────────┼───────────────────────────────┤
+  │ Missing code in body                    │ 422 ✓                         │
+  └─────────────────────────────────────────┴───────────────────────────────┘
+
+  Requirement-by-requirement verification
+
+  Every case you listed behaves per the agreed decisions:
+
+  - valid discount → 200, discount recorded, total reduced ✓
+  - unknown code → 404 ✓ · expired code → 400 ✓
+  - discount cap → min(calc, cap); SUPER60 caps at 4000 ✓
+  - fractional-paise rounding → half-up, verified at unit and endpoint level ✓
+  - partner/RAYY split → amounts + bps snapshotted; complement always re-sums ✓
+  - second discount → 409 ✓ · paid order → 409 ✓
+  - concurrent discounts → exactly one 200, one 409 ✓
+  - invalid/missing signature → 401 ✓ · amount mismatch → 400 ✓
+  - duplicate webhook → idempotent 200, no second payment ✓
+  - concurrent duplicate webhooks → all 200, paid once ✓
+  - failed requests never partially modify → confirmed for all five failure
+  paths ✓
+  - integer paise everywhere → grep confirms no float/round()/real division in
+  app/; pricing uses // only ✓
+
+  No requirement is incorrectly implemented. The diff is minimal and targeted
+  (138 insertions across 5 files + 4 new files); no unnecessary changes.
+
+  Issues found
+
+  All are low-severity robustness gaps, none blocking. Explaining before any fix
+  (and I've changed nothing yet):
+
+  1. Validly-signed malformed webhook body → 500, not 400.
+  payments.process_webhook does json.loads(raw_body) and
+  body["order_id"]/["amount_paise"]/["payment_id"] after the signature check. A
+  signed-but-malformed or key-missing body raises JSONDecodeError/KeyError →
+  unhandled 500. Only reachable by someone holding the webhook secret (signature
+  is verified first), so real-world risk is low, but a 400 would be cleaner
+  than a 500.
+  2. Float amount_paise would bypass the integer-money rule. The handler
+  compares body["amount_paise"] != order["total_paise"]. If a sender passed
+  45900.0, Python's 45900.0 == 45900 is True, so it'd pass and be stored as a
+  float in payment. The gateway's create_payment rejects non-ints at source
+  (gateway.py:41), so this can't happen via the real path — but there's no
+  explicit isinstance(..., int) guard at the webhook boundary, unlike elsewhere
+  in the codebase.
+  3. event field is not validated. The handler never checks body["event"] == 
+  "payment.succeeded". The stub only emits that event, so it's moot today, but
+  any future event type would still mark the order paid.
+  4. Minor: 409 message precision. If an order is paid in the race window
+  between apply_discount's read and the atomic set_discount, the guard correctly
+  rejects with 409 but the detail reads "discount already applied" rather than
+  "order already paid". Correct status, slightly imprecise message. Not worth
+  special-casing.
+
+  No genuine race conditions found. Both write paths are guarded by
+  single-document atomic conditional updates (modified_count), which are atomic
+  in real MongoDB and effectively atomic under mongomock's single-threaded
+  model. The check-then-update TOCTOU in both services is backstopped by the
+  DB-level filter, so interleaving cannot double-apply or double-pay.
+
+  Missing test coverage (in the committed suite)
+
+  Worth adding before or alongside client work:
+
+  1. Concurrent duplicate webhooks — only in my throwaway script, not the suite.
+  This is the headline idempotency-under-concurrency guarantee and should be a
+  permanent test.
+  2. Partial-modification assertions strengthened — current failure tests check
+  the status code (and webhook ones check status == pending), but don't assert
+  the absence of a discount/payment field or full-document equality. The
+  guarantee holds (verified ad-hoc); it just isn't locked in by the suite.
+  3. Non-exact funding split at integration level — only unit-tested; the
+  SUPER60 happy-path test happens to use an exact split (2200/1800). A persisted
+  non-exact case (e.g. 4913/2106) would catch a regression in the service
+  wiring.
+  4. Missing/empty code body → 422 — not asserted.
+  5. Two distinct payment_ids for the same order — behaviour (second is ignored)
+  is unspecified and untested; worth a test to pin it down.
+  6. (Only if we decide to harden) malformed-signed-body and event-type tests,
+  matching issues 1 and 3.
+
+  Is the backend ready for client development?
+
+  Yes. All agreed behaviours are correct, money is integer-only, failures are
+  atomic with no partial writes, and concurrency/idempotency hold under both the
+  mongomock and (by construction) real-Mongo models. The four issues are
+  robustness hardening on paths unreachable without the webhook secret or the
+  real gateway — none affect the client contract (GET /orders/{id}, POST 
+  /apply-discount, POST /webhooks/payment, and the Order shape incl.
+  discount/status).
+
+  My recommendation: proceed to the client, and in a short follow-up fold in the
+  missing tests (items 1–5 above) plus optionally issues 1–3. Want me to (a) go
+  straight to the client, (b) add the missing tests first, or (c) add the tests
+  and apply the three hardening fixes before the client?
+
+✻ Brewed for 2m 36s
+
+> Add the missing tests first and do the low-severity robustness gaps.          
+
+● I'll harden the webhook handler for the three gaps, then add the missing
+  tests. Let me set up tasks and start.
+
+● Let me harden the webhook service first.
+
+● Write(app\services\payments.py)  ⎿  Added 24 lines, removed 4 lines
+      16      pass
+      17  
+      18  
+      19 +class MalformedWebhook(Exception):                             
+      20 +    """A signed body we can't process: bad JSON, missing fields
+         +, wrong event,                                                 
+      21 +    or a non-integer amount."""                                
+      22 +                                                               
+      23 +                                                               
+      24  class AmountMismatch(Exception):
+      25      pass
+      26  
+      27  
+      28 +EXPECTED_EVENT = "payment.succeeded"                           
+      29 +REQUIRED_KEYS = ("event", "payment_id", "order_id", "amount_pai
+         +se")                                                           
+      30 +                                                               
+      31  _gateway = StubGateway()
+      32  
+      33  
+     ...
+      39      if signature is None or not hmac.compare_digest(_gateway.si
+          gn(raw_body), signature):
+      40          raise BadSignature()
+      41  
+      34 -    body = json.loads(raw_body)                                
+      35 -    order_id = body["order_id"]                                
+      42 +    try:                                                       
+      43 +        body = json.loads(raw_body)                            
+      44 +    except (json.JSONDecodeError, ValueError):                 
+      45 +        raise MalformedWebhook("invalid JSON")                 
+      46 +    if not isinstance(body, dict) or any(key not in body for ke
+         +y in REQUIRED_KEYS):                                           
+      47 +        raise MalformedWebhook("missing required fields")      
+      48 +    if body["event"] != EXPECTED_EVENT:                        
+      49 +        raise MalformedWebhook(f"unexpected event {body['event'
+         +]!r}")                                                         
+      50  
+      51 +    amount_paise = body["amount_paise"]                        
+      52 +    # All money is integer paise; bool is an int subclass, so e
+         +xclude it.                                                     
+      53 +    if not isinstance(amount_paise, int) or isinstance(amount_p
+         +aise, bool):                                                   
+      54 +        raise MalformedWebhook("amount_paise must be an integer
+         +")                                                             
+      55 +                                                               
+      56 +    order_id = body["order_id"]                                
+      57      order = await orders_repo.get(order_id)
+      58      if order is None:
+      59          raise OrderNotFound(order_id)
+      60  
+      41 -    if body["amount_paise"] != order["total_paise"]:           
+      61 +    if amount_paise != order["total_paise"]:                   
+      62          raise AmountMismatch(order_id)
+      63  
+      44 -    payment = {"payment_id": body["payment_id"], "amount_paise"
+         -: body["amount_paise"]}                                        
+      64 +    payment = {"payment_id": body["payment_id"], "amount_paise"
+         +: amount_paise}                                                
+      65      # modified_count == 0 means the order was already paid (dup
+          licate delivery):
+      66      # a no-op, no second payment written.
+      67      await orders_repo.mark_paid(order_id, payment)
+
+● Update(app\api\webhooks.py)
+  ⎿  Added 2 lines
+      16          await payments.process_webhook(raw_body, signature)
+      17      except payments.BadSignature:
+      18          raise HTTPException(status_code=401, detail="invalid si
+          gnature")
+      19 +    except payments.MalformedWebhook as exc:                   
+      20 +        raise HTTPException(status_code=400, detail=str(exc))  
+      21      except OrderNotFound:
+      22          raise HTTPException(status_code=404, detail="order not 
+          found")
+      23      except payments.AmountMismatch:
+
+● Now the tests. First, append to test_webhooks.py — add a raw-signing helper
+  and the new cases.
+
+● Update(tests\test_webhooks.py)
+  ⎿  Error editing file
+
+  Read 1 file (ctrl+o to expand)
+
+● Line 20 differs from my memory. Let me make precise edits.
+
+● Update(tests\test_webhooks.py)
+  ⎿  Added 6 lines, removed 1 line
+      1  """POST /webhooks/payment — signed, idempotent payment handling.
+         """
+      2  
+      3 +import asyncio                                                  
+      4  import json
+      5  
+      6  from app.db import ORDERS
+     ...
+       9  GATEWAY = StubGateway(webhook_secret="whsec_test")  # matches c
+          onftest's env
+      10  
+      11  
+      12 +def _sign(raw: bytes) -> dict:                                 
+      13 +    return {SIGNATURE_HEADER: GATEWAY.sign(raw), "Content-Type"
+         +: "application/json"}                                          
+      14 +                                                               
+      15 +                                                               
+      16  def _signed(order_id: str, amount_paise: int, payment_id: str =
+           "pay_test_1"):
+      17      """Build the (content, headers) for a payment.succeeded web
+          hook."""
+      18      body = {
+     ...
+      22          "amount_paise": amount_paise,
+      23      }
+      24      raw = json.dumps(body, separators=(",", ":")).encode()
+      20 -    return raw, {SIGNATURE_HEADER: GATEWAY.sign(raw), "Content-
+         -Type": "application/json"}                                     
+      25 +    return raw, _sign(raw)                                     
+      26  
+      27  
+      28  async def test_happy_path_marks_paid_and_records_payment(client
+          ):
+
+● Now strengthen the mismatch/bad-signature partial-modification asserts and
+  append the new webhook tests:
+
+● Update(tests\test_webhooks.py)
+  ⎿  Added 3 lines, removed 2 lines
+      42      assert response.status_code == 401
+      43  
+      44  
+      45 -async def test_bad_signature_is_401(client):                   
+      45 +async def test_bad_signature_is_401(client, db):               
+      46      raw, headers = _signed("ord_c_3003", 45900)
+      47      headers[SIGNATURE_HEADER] = "deadbeef"
+      48      response = await client.post("/webhooks/payment", content=r
+          aw, headers=headers)
+      49      assert response.status_code == 401
+      50 -    assert (await client.get("/orders/ord_c_3003")).json()["sta
+         -tus"] == "pending"                                             
+      50 +    doc = await db[ORDERS].find_one({"_id": "ord_c_3003"})     
+      51 +    assert doc["status"] == "pending" and "payment" not in doc 
+      52  
+      53  
+      54  async def test_unknown_order_is_404(client):
+
+● Update(tests\test_webhooks.py)
+  ⎿  Added 3 lines, removed 2 lines
+      57      assert response.status_code == 404
+      58  
+      59  
+      60 -async def test_amount_mismatch_is_400(client):                 
+      60 +async def test_amount_mismatch_is_400(client, db):             
+      61      raw, headers = _signed("ord_c_3003", 1)  # order total is 4
+          5900
+      62      response = await client.post("/webhooks/payment", content=r
+          aw, headers=headers)
+      63      assert response.status_code == 400
+      64 -    assert (await client.get("/orders/ord_c_3003")).json()["sta
+         -tus"] == "pending"                                             
+      64 +    doc = await db[ORDERS].find_one({"_id": "ord_c_3003"})     
+      65 +    assert doc["status"] == "pending" and "payment" not in doc 
+      66  
+      67  
+      68  async def test_amount_checked_against_discounted_total(client):
+
+● Now append the new webhook cases at the end of the file:
+
+● Update(tests\test_webhooks.py)
+  ⎿  Added 60 lines
+       89      order = await db[ORDERS].find_one({"_id": "ord_c_3003"})
+       90      assert order["status"] == "paid"
+       91      assert order["payment"] == {"payment_id": "pay_c_9001", "a
+           mount_paise": 45900}
+       92 +                                                              
+       93 +                                                              
+       94 +async def test_concurrent_duplicate_deliveries_pay_once(client
+          +, db):                                                        
+       95 +    # Five simultaneous deliveries of the same payment: paid o
+          +nce, one payment.                                             
+       96 +    raw, headers = _signed("ord_c_3003", 45900, payment_id="pa
+          +y_c_9001")                                                    
+       97 +    results = await asyncio.gather(                           
+       98 +        *[client.post("/webhooks/payment", content=raw, header
+          +s=headers) for _ in range(5)]                                 
+       99 +    )                                                         
+      100 +    assert all(r.status_code == 200 for r in results)         
+      101 +    doc = await db[ORDERS].find_one({"_id": "ord_c_3003"})    
+      102 +    assert doc["status"] == "paid"                            
+      103 +    assert doc["payment"] == {"payment_id": "pay_c_9001", "amo
+          +unt_paise": 45900}                                            
+      104 +                                                              
+      105 +                                                              
+      106 +async def test_second_distinct_payment_is_ignored(client, db):
+      107 +    # First payment wins; a later distinct payment_id for a pa
+          +id order is a no-op.                                          
+      108 +    raw1, h1 = _signed("ord_c_3003", 45900, payment_id="pay_fi
+          +rst")                                                         
+      109 +    assert (await client.post("/webhooks/payment", content=raw
+          +1, headers=h1)).status_code == 200                            
+      110 +    raw2, h2 = _signed("ord_c_3003", 45900, payment_id="pay_se
+          +cond")                                                        
+      111 +    assert (await client.post("/webhooks/payment", content=raw
+          +2, headers=h2)).status_code == 200                            
+      112 +    doc = await db[ORDERS].find_one({"_id": "ord_c_3003"})    
+      113 +    assert doc["payment"]["payment_id"] == "pay_first"        
+      114 +                                                              
+      115 +                                                              
+      116 +async def test_malformed_but_signed_body_is_400(client, db):  
+      117 +    raw = b"{not valid json"                                  
+      118 +    response = await client.post("/webhooks/payment", content=
+          +raw, headers=_sign(raw))                                      
+      119 +    assert response.status_code == 400                        
+      120 +    assert (await db[ORDERS].find_one({"_id": "ord_c_3003"}))[
+          +"status"] == "pending"                                        
+      121 +                                                              
+      122 +                                                              
+      123 +async def test_missing_fields_is_400(client):                 
+      124 +    raw = json.dumps({"event": "payment.succeeded"}, separator
+          +s=(",", ":")).encode()                                        
+      125 +    response = await client.post("/webhooks/payment", content=
+          +raw, headers=_sign(raw))                                      
+      126 +    assert response.status_code == 400                        
+      127 +                                                              
+      128 +                                                              
+      129 +async def test_unexpected_event_is_400(client, db):           
+      130 +    body = {                                                  
+      131 +        "event": "payment.refunded",                          
+      132 +        "payment_id": "pay_x",                                
+      133 +        "order_id": "ord_c_3003",                             
+      134 +        "amount_paise": 45900,                                
+      135 +    }                                                         
+      136 +    raw = json.dumps(body, separators=(",", ":")).encode()    
+      137 +    response = await client.post("/webhooks/payment", content=
+          +raw, headers=_sign(raw))                                      
+      138 +    assert response.status_code == 400                        
+      139 +    assert (await db[ORDERS].find_one({"_id": "ord_c_3003"}))[
+          +"status"] == "pending"                                        
+      140 +                                                              
+      141 +                                                              
+      142 +async def test_non_integer_amount_is_400(client):             
+      143 +    body = {                                                  
+      144 +        "event": "payment.succeeded",                         
+      145 +        "payment_id": "pay_x",                                
+      146 +        "order_id": "ord_c_3003",                             
+      147 +        "amount_paise": 45900.0,  # float — money must be inte
+          +ger paise                                                     
+      148 +    }                                                         
+      149 +    raw = json.dumps(body, separators=(",", ":")).encode()    
+      150 +    response = await client.post("/webhooks/payment", content=
+          +raw, headers=_sign(raw))                                      
+      151 +    assert response.status_code == 400                        
+
+● Now the discount tests — strengthen partial-modification and add non-exact
+  split + 422 cases.
+
+● Update(tests\test_discounts.py)
+  ⎿  Added 26 lines, removed 2 lines
+      20      assert body["discount"]["rayy_share_bps"] == 4500
+      21  
+      22  
+      23 -async def test_unknown_code_is_404(client):                    
+      23 +async def test_apply_non_exact_split_persists(client):         
+      24 +    # KIDS18 on ord_c_3005 (38997): 1800bps -> 7019.46 -> 7019 
+         +(half-up).                                                     
+      25 +    # 70% partner share -> 4913.3 -> 4913, RAYY takes the compl
+         +ement 2106.                                                    
+      26 +    response = await client.post("/orders/ord_c_3005/apply-disc
+         +ount", json={"code": "KIDS18"})                                
+      27 +    assert response.status_code == 200                         
+      28 +    body = response.json()                                     
+      29 +    assert body["discount"]["amount_paise"] == 7019            
+      30 +    assert body["total_paise"] == 38997 - 7019                 
+      31 +    assert body["discount"]["partner_amount_paise"] == 4913    
+      32 +    assert body["discount"]["rayy_amount_paise"] == 2106       
+      33 +    assert body["discount"]["partner_amount_paise"] + body["dis
+         +count"]["rayy_amount_paise"] == 7019                           
+      34 +                                                               
+      35 +                                                               
+      36 +async def test_unknown_code_is_404_and_no_partial_write(client,
+         + db):                                                          
+      37 +    before = await db[ORDERS].find_one({"_id": "ord_c_3001"})  
+      38      response = await client.post("/orders/ord_c_3001/apply-disc
+          ount", json={"code": "NOPE"})
+      39      assert response.status_code == 404
+      40 +    after = await db[ORDERS].find_one({"_id": "ord_c_3001"})   
+      41 +    assert after == before and "discount" not in after         
+      42  
+      43  
+      44  async def test_unknown_order_is_404(client):
+     ...
+      46      assert response.status_code == 404
+      47  
+      48  
+      33 -async def test_expired_code_is_400(client):                    
+      49 +async def test_expired_code_is_400_and_no_partial_write(client,
+         + db):                                                          
+      50      # apply_3: PAST30 (expires_in_days -1) on ord_c_3002.
+      51 +    before = await db[ORDERS].find_one({"_id": "ord_c_3002"})  
+      52      response = await client.post("/orders/ord_c_3002/apply-disc
+          ount", json={"code": "PAST30"})
+      53      assert response.status_code == 400
+      54 +    after = await db[ORDERS].find_one({"_id": "ord_c_3002"})   
+      55 +    assert after == before and "discount" not in after         
+      56  
+      57  
+      58 +async def test_missing_code_body_is_422(client):               
+      59 +    response = await client.post("/orders/ord_c_3001/apply-disc
+         +ount", json={})                                                
+      60 +    assert response.status_code == 422                         
+      61 +                                                               
+      62 +                                                               
+      63  async def test_second_discount_is_409(client):
+      64      # apply_5: KIDS18 then FIRST5 on ord_c_3004, one after anot
+          her.
+      65      first = await client.post("/orders/ord_c_3004/apply-discoun
+          t", json={"code": "KIDS18"})
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All 35 pass (+8 new). Let me confirm the new tests ran and clean up.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● All new tests are present and passing. Now update NOTES.md to reflect the
+  hardening.
+
+● Update(NOTES.md)
+  ⎿  Added 9 lines
+      74  reference scenarios, not must-pass assertions, so the tests bui
+          ld
+      75  correctly-priced webhooks.
+      76  
+      77 +### Webhook input hardening                                    
+      78 +                                                               
+      79 +After signature verification, a signed body is still validated 
+         +before use: bad                                                
+      80 +JSON, missing fields, an unexpected `event` (only `payment.succ
+         +eeded` is                                                      
+      81 +handled), or a non-integer `amount_paise` all return `400` (nev
+         +er a 500, and                                                  
+      82 +nothing is written). A second *distinct* `payment_id` for an al
+         +ready-paid order                                               
+      83 +is a no-op `200` — first payment wins. These paths are only rea
+         +chable by a holder                                             
+      84 +of the webhook secret but are covered by tests.                
+      85 +                                                               
+      86  ### Concurrency & idempotency — no transactions
+      87  
+      88  Both write paths use **single-document atomic conditional updat
+          es**, not
+
+● Update(NOTES.md)
+  ⎿  Added 2 lines, removed 2 lines
+      110  - Settlement is described, not built — no settlement endpoint 
+           or aggregation
+      111    query exists yet.
+      112  - Idempotency relies on the order's paid-state, not a dedicate
+           d processed-events
+      113 -  log; a second *distinct* `payment_id` for an already-paid or
+          -der is silently                                               
+      114 -  ignored rather than flagged.                                
+      113 +  log; a second *distinct* `payment_id` for an already-paid or
+          +der is ignored                                                
+      114 +  (no-op `200`) rather than flagged for reconciliation.       
+      115  - Amount-match policy (reject on mismatch) is a judgement call
+           ; a real gateway
+      116    integration might record-and-reconcile instead.
+      117  
+
+● Final full-suite run to confirm everything's green:
+  Ran 1 shell command (ctrl+o to expand)
+
+● Done. 35/35 tests pass (was 27; +8 new).
+
+  Robustness fixes applied
+
+  In app/services/payments.py (+ route mapping in app/api/webhooks.py), after
+  signature verification a signed body is now fully validated before use:
+
+  1. Malformed JSON → 400 (was an unhandled 500). json.loads wrapped; raises
+  MalformedWebhook.
+  2. Missing required fields → 400 (was a 500 KeyError).
+  3. Unexpected event → 400. Only payment.succeeded is processed; any other
+  event is rejected instead of silently marking the order paid.
+  4. Non-integer amount_paise → 400, with a bool guard (since bool is an int
+  subclass) — closes the float-equality gap so money stays strictly integer
+  paise at the webhook boundary.
+
+  The 409-message imprecision (issue 4 from the review) I left as-is — correct
+  status, and special-casing it would add noise for a cosmetic detail.
+
+  Tests added
+
+  Webhooks (6): concurrent duplicate deliveries (×5 → paid once, one payment);
+  second distinct payment_id ignored; malformed-but-signed body → 400; missing
+  fields → 400; unexpected event → 400; non-integer amount → 400. Plus
+  strengthened the mismatch and bad-signature tests to assert no payment field
+  is written, not just status.
+
+  Discounts (2 new + strengthened): non-exact funding split persisted at the
+  endpoint (KIDS18 on ord_c_3005: 7019 discount → 4913/2106, re-summing
+  exactly); missing code body → 422; unknown-code and expired-code tests now
+  assert the order document is byte-identical before/after (no partial write).
+
+  NOTES.md updated
+
+  Added a "Webhook input hardening" subsection documenting the new 400 paths and
+  the distinct-payment-id behaviour, and adjusted the production-caveats bullet
+  to match.
+
+  The three placeholders in NOTES.md (AI-caught mistake, time spent) are still
+  yours to fill. Scratchpad cleaned up; implementation diff remains minimal and
+  targeted.
+
+  Backend is validated and hardened — ready for client development. Want me to
+  proceed with the client now, and React or Flutter?
+
+✻ Worked for 2m 45s
+
+> /plugin install frontend-design@anthropics/claude-code                        
+  ⎿  Marketplace "anthropics/claude-code" not found
+
+> /plugin                                                                       
+  ⎿  ✓ Installed frontend-design. Run /reload-plugins to apply.
+
+> /reload-plugins                                                               
+  ⎿  Reloaded: 1 plugin · 0 skills · 6 agents · 0 hooks · 0 plugin MCP servers · 0 plugin LSP servers
+
+> /plan Before making any client changes, read the README and inspect the       
+existing client code and backend API contract. Use the assignment requirements  
+in the README as the source of truth.                                           
+                                                                                
+Then implement the React client required by the assignment.                     
+                                                                                
+Do not make unnecessary changes.                                                
+                                                                                
+Implement:                                                                      
+                                                                                
+Order summary showing:                                                          
+subtotal                                                                        
+discount                                                                        
+total                                                                           
+formatPaise for displaying integer paise correctly.                             
+Payment flow with:                                                              
+Pay while ready                                                                 
+disabled with loading state while processing                                    
+Paid and disabled after successful payment                                      
+On payment failure:                                                             
+show Payment failed                                                             
+allow retry                                                                     
+Add the required frontend tests.                                                
+                                                                                
+Before coding, briefly tell me:                                                 
+                                                                                
+what the README requires                                                        
+which existing files are relevant                                               
+which files you plan to change                                                  
+                                                                                
+After implementation:                                                           
+                                                                                
+run the frontend tests                                                          
+verify the implementation against the README                                    
+verify it matches the backend API                                               
+review the diff for unnecessary changes                                         
+summarize what was implemented and any issues found                             
+                                                                                
+Do not modify the backend unless you find a genuine API mismatch.               
+  ⎿  Enabled plan mode
+
+● I'm in plan mode. Let me re-read the README's client requirements and inspect
+  the existing React client files and the test setup before planning.
+
+  Read 6 files (ctrl+o to expand)
+
+● I've re-read the README client requirements (from earlier) and inspected all
+  the existing client files. This is isolated to the React starter — I know
+  exactly what's needed, so no agents required. Let me briefly answer your
+  pre-coding questions, then write the plan.
+
+  What the README requires (§4):
+  - formatPaise(paise: number): integer paise → rupees, en-IN digit grouping,
+  exactly 2 decimals, integer maths only. 199999→₹1,999.99,
+  12345678→₹1,23,456.78, 5→₹0.05, 0→₹0.00. Throws on a non-integer.
+  - OrderSummary: show subtotal, discount code + amount when present, and total,
+  all via formatPaise.
+  - A "Pay" button: disabled while a payment is in progress (still reads "Pay");
+  reads "Paid" and stays disabled only when order.status === "paid".
+  - On failure: show an element with role="alert" and allow retry.
+  - Keep the starter's file names, exports, and doc-comment contract; add tests.
+
+  Relevant existing files: client/web/src/formatPaise.ts (stub),
+  OrderSummary.tsx (placeholder with the contract docstring + {order, onPay}
+  props), types.ts (Order, discount: null | {code, amount_paise}),
+  OrderSummary.test.tsx (one passing render test asserting the region named
+  "Order summary"), plus setupTests.ts/vite.config.ts (vitest + jsdom + jest-dom
+  already wired).
+
+  Files I plan to change: formatPaise.ts (implement), OrderSummary.tsx
+  (implement), OrderSummary.test.tsx (add behaviour tests, keep the existing
+  one), and a new formatPaise.test.ts. No backend changes.
+
+  Now let me write the plan file (overwriting the completed backend plan, since
+  this is a new task).
+
+● Updated plan
+  ⎿  /plan to preview
+
+● The plan is written and scoped tightly. No open questions — the contracts are
+  fully specified by the README and I've verified the formatPaise grouping by
+  hand.
+  ⎿  User rejected Claude's plan:
+     ╭─────────────────────────────────────────────────────────────────────────╮
+     │ Plan: React client (order summary + pay flow)                           │
+     │                                                                         │
+     │ Context                                                                 │
+     │                                                                         │
+     │ The backend (discounts + payment webhook) is complete and validated (35 │
+     │ tests                                                                   │
+     │ green). The remaining required deliverable is the client. We pick React │
+     │ (client/web/). The README (§4) defines exact contracts that tests grade │
+     │ against: formatPaise output strings, the subtotal/discount/total        │
+     │ display, and                                                            │
+     │ the Pay-button state machine. The starter ships stubs; this fills them  │
+     │ in without                                                              │
+     │ changing file names, exports, or the doc-comment contracts, and adds    │
+     │ tests.                                                                  │
+     │                                                                         │
+     │ No backend changes — the client only consumes the existing Order shape  │
+     │ (client/web/src/types.ts): order_id, subtotal_paise, total_paise,       │
+     │ status, discount: null | { code, amount_paise }.                        │
+     │                                                                         │
+     │ Scope                                                                   │
+     │                                                                         │
+     │ Four files, all under client/web/src/:                                  │
+     │                                                                         │
+     │ ┌───────────────────────┬────────────────────────────────────────────── │
+     │ ────┐                                                                   │
+     │ │         File          │                      Change                   │
+     │    │                                                                    │
+     │ ├───────────────────────┼────────────────────────────────────────────── │
+     │ ────┤                                                                   │
+     │ │ formatPaise.ts        │ implement (currently throws "not              │
+     │ implemented")   │                                                       │
+     │ ├───────────────────────┼────────────────────────────────────────────── │
+     │ ────┤                                                                   │
+     │ │ OrderSummary.tsx      │ implement summary + pay flow (currently       │
+     │    │                                                                    │
+     │ │                       │ placeholder)                                  │
+     │    │                                                                    │
+     │ ├───────────────────────┼────────────────────────────────────────────── │
+     │ ────┤                                                                   │
+     │ │ formatPaise.test.ts   │ new — unit tests for the README examples +    │
+     │ throw │                                                                 │
+     │ ├───────────────────────┼────────────────────────────────────────────── │
+     │ ────┤                                                                   │
+     │ │ OrderSummary.test.tsx │ add behaviour tests; keep the existing render │
+     │    │                                                                    │
+     │ │                       │ test                                          │
+     │    │                                                                    │
+     │ └───────────────────────┴────────────────────────────────────────────── │
+     │ ────┘                                                                   │
+     │                                                                         │
+     │ Keep styling minimal (plain semantic markup, no CSS files) — the README │
+     │ grades                                                                  │
+     │ behaviour and the exact contracts, not visuals. "Do not make            │
+     │ unnecessary changes."                                                   │
+     │                                                                         │
+     │ formatPaise.ts                                                          │
+     │                                                                         │
+     │ Integer maths only — no float division of the amount:                   │
+     │                                                                         │
+     │ - if (!Number.isInteger(paise)) throw new Error(...) (README: TS throws │
+     │ on a                                                                    │
+     │ non-integer).                                                           │
+     │ - Handle negatives defensively (prefix -), using Math.abs; examples are │
+     │ all                                                                     │
+     │ non-negative so this is just robustness, not a spec requirement.        │
+     │ - rupees = Math.floor(abs / 100), paiseRem = abs % 100 (both exact for  │
+     │ safe                                                                    │
+     │ integers; % avoids fractional rounding).                                │
+     │ - en-IN grouping of the rupee integer via string ops: last 3 digits,    │
+     │ then the                                                                │
+     │ remaining prefix in groups of 2 —                                       │
+     │ other.replace(/\B(?=(\d{2})+(?!\d))/g, ",").                            │
+     │ - Return `₹${sign}${grouped}.${String(paiseRem).padStart(2, "0")}`.     │
+     │ - Verified by hand: 199999→₹1,999.99, 12345678→₹1,23,456.78, 5→₹0.05,   │
+     │ 0→₹0.00.                                                                │
+     │                                                                         │
+     │ OrderSummary.tsx                                                        │
+     │                                                                         │
+     │ Keep the exported signature OrderSummary(props: { order; onPay }):      │
+     │ JSX.Element                                                             │
+     │ and the <section aria-label="Order summary"> wrapper (the existing test │
+     │ asserts                                                                 │
+     │ getByRole("region", { name: "Order summary" })).                        │
+     │                                                                         │
+     │ Local state (minimal):                                                  │
+     │ const [pending, setPending] = useState(false);                          │
+     │ const [failed, setFailed]   = useState(false);                          │
+     │ const isPaid = order.status === "paid";                                 │
+     │ handlePay: clear failed, set pending, await onPay() in try/catch — on   │
+     │ throw set failed=true; finally clears pending.                          │
+     │                                                                         │
+     │ Render:                                                                 │
+     │ - <h2>Order {order.order_id}</h2> (already there).                      │
+     │ - Subtotal: formatPaise(order.subtotal_paise).                          │
+     │ - Discount row only when order.discount — show order.discount.code and  │
+     │ formatPaise(order.discount.amount_paise).                               │
+     │ - Total: formatPaise(order.total_paise).                                │
+     │ - Button: disabled={isPaid || pending}, label isPaid ? "Paid" : "Pay"   │
+     │ (so it stays "Pay" while pending; "Paid" only when the prop status is   │
+     │ paid).                                                                  │
+     │ - {failed && <div role="alert">Payment failed</div>}.                   │
+     │                                                                         │
+     │ Retry works for free: after a failure, pending is false and failed      │
+     │ clears on                                                               │
+     │ the next click, so a second onPay runs.                                 │
+     │                                                                         │
+     │ Tests                                                                   │
+     │                                                                         │
+     │ formatPaise.test.ts — the four README examples; throws on 1.5 /         │
+     │ non-integer; a large-grouping case (e.g. 1234567890).                   │
+     │                                                                         │
+     │ OrderSummary.test.tsx (keep the existing render test; add):             │
+     │ - subtotal + total rendered via formatPaise (assert the formatted       │
+     │ strings).                                                               │
+     │ - discount row shown with code + amount when discount present; absent   │
+     │ when                                                                    │
+     │ null.                                                                   │
+     │ - status: "paid" → button reads "Paid" and is disabled.                 │
+     │ - pending: with a deferred promise for onPay, after click the button is │
+     │ disabled and still reads "Pay"; resolve → re-enabled.                   │
+     │ - failure: onPay rejects → role="alert" ("Payment failed") appears and  │
+     │ the                                                                     │
+     │ button is re-enabled; a second click retries (assert onPay called       │
+     │ twice).                                                                 │
+     │                                                                         │
+     │ Use @testing-library/react + user-event (already deps). Control         │
+     │ pending/                                                                │
+     │ failure with a manually-resolved/rejected promise.                      │
+     │                                                                         │
+     │ Verification                                                            │
+     │                                                                         │
+     │ cd client/web                                                           │
+     │ npm ci          # first run only (installs vitest/testing-library)      │
+     │ npm test        # vitest run — all tests green                          │
+     │ npm run typecheck   # tsc --noEmit — no type errors                     │
+     │                                                                         │
+     │ Then verify against the README: formatPaise outputs match the four      │
+     │ examples;                                                               │
+     │ button states match the "Pay"/"Paid"/disabled rules; failure shows      │
+     │ role="alert"                                                            │
+     │ and allows retry. Confirm the Order shape consumed matches types.ts and │
+     │ the                                                                     │
+     │ backend's serialized order (discount.code, discount.amount_paise,       │
+     │ status).                                                                │
+     │                                                                         │
+     │ Out of scope                                                            │
+     │                                                                         │
+     │ - Backend (no changes unless a genuine API mismatch surfaces).          │
+     │ - Flutter starter (React chosen; note in NOTES.md).                     │
+     │ - prompts/ export (user-provided deliverable).                          │
+     │ - NOTES.md already records the React choice? → add the "chose React"    │
+     │ line if                                                                 │
+     │ missing during implementation.                                          │
+     ╰─────────────────────────────────────────────────────────────────────────╯
+
+✻ Brewed for 2m 57s
+
+> /frontend-design:frontend-design                                              
+
+● Good call to bring real design intent to this — the user is paying for a
+  distinctive checkout, not plain markup. I'm still in plan mode, so let me fold
+  a grounded design direction into the plan (and I caught one hard constraint
+  the design must respect: the button's accessible name must stay exactly
+  "Pay"/"Paid" per the README contract, so the amount can't live inside the
+  button).
+
+  Let me first confirm what the demo/order data actually describes, so the
+  design is grounded in the real subject.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Confirmed: the subject is a kids' creative-arts studio (art classes,
+  workshops, term passes) and the viewer is a parent paying for a booking. That
+  grounds the design. Let me write the revised plan.
+
+● Updated plan
+  ⎿  /plan to preview
+
+● The plan now incorporates the design direction. It's grounded in the real
+  subject (kids' art studio), takes a deliberate non-generic position
+  (sugar-paper + riso two-ink enrollment slip), and keeps every README contract
+  intact — including the catch that the button's accessible name must stay
+  exactly "Pay"/"Paid".
+
+● User approved Claude's plan
+  ⎿  Plan saved to: ~\.claude\plans\buzzing-conjuring-moon.md · /plan to edit
+     Plan: React client — studio enrollment-slip order summary
+
+     Context
+
+     The backend (discounts + payment webhook) is complete and validated (35
+     tests
+     green). The remaining required deliverable is the client; we pick React
+     (client/web/). The README (§4) defines exact contracts tests grade against:
+     formatPaise output strings, the subtotal/discount/total display, and the
+     Pay-button state machine. This fills the starter stubs — keeping file
+     names,
+     exports, and doc-comment contracts — adds tests, and gives the UI a
+     distinctive,
+     subject-grounded design (frontend-design skill).
+
+     No backend changes. The client consumes the existing Order shape
+     (client/web/src/types.ts): order_id, subtotal_paise, total_paise,
+     status, discount: null | { code, amount_paise }.
+
+     Subject (grounds the design): seed orders are a kids' creative-arts studio
+     —
+     "Kids art class", "Weekend workshop", "Art term pass". The viewer is a
+     parent
+     reviewing a booking and paying. The summary is a studio enrollment slip /
+     receipt, not a cold fintech panel.
+
+     Hard contract constraints (design must not break these)
+
+     - <section aria-label="Order summary"> stays (existing test asserts the
+     region named "Order summary").
+     - Button accessible name is exactly Pay / Paid — so the amount cannot
+     live inside the button; it goes in the total line.
+     - Button disabled while pending (label still "Pay"); "Paid" + disabled only
+     when order.status === "paid".
+     - Failure shows an element with role="alert" whose text contains "Payment
+     failed", and the button re-enables for retry.
+     - Every money value renders through formatPaise.
+
+     Design direction (one bold moment, disciplined around it)
+
+     Deliberately avoids the AI-generic looks (no cream+serif+terracotta, no
+     black+acid-green, no broadsheet hairlines, no identical SaaS cards, no
+     all-caps
+     eyebrows / middle-dot meta / → buttons). Instead: a riso-print, sugar-paper
+     identity drawn from the art-studio world.
+
+     Color (sugar-paper ground + two riso inks):
+     - Page ground #DCE3E1 (pale blue-grey sugar paper used in art rooms)
+     - Card surface #FBFBF8
+     - Ink / primary text #232043 (riso midnight indigo)
+     - Accent #EC3F7C (riso fluor pink) — the savings figure + the Pay action
+     - Muted #6C6A82; Confirmed/paid #2F7D5B (riso green)
+
+     Type (two clearly-distinct families, Google Fonts):
+     - Display — Space Grotesk (order id + money figures), tabular-nums so the
+     receipt column aligns (tabular numerals are functional here, not a
+     mono-label
+     affectation).
+     - Body / labels — Inter.
+
+     Layout — one centered enrollment slip; receipt line items (label left,
+     figure
+     right), a dashed "perforation" rule as the one structural device (grounded
+     in the
+     receipt, not broadsheet decoration), emphasized total, then the accent
+     moment:
+
+                 (sugar-paper ground)
+        ┌──────────────────────────────────┐
+        │  Order ord_c_3005                 │  Space Grotesk, ink
+        │                                   │
+        │  Subtotal              ₹389.97    │  Inter labels, tabular figures
+        │  Discount · KIDS18     −₹70.19    │  amount in accent pink
+        │  — — — — — — — — — — — — — — — —   │  dashed perforation rule
+        │  Total                 ₹319.78    │  larger, ink, bold  ← anchor
+        │                                   │
+        │  You save ₹70.19 with KIDS18      │  accent — the one memorable line
+        │                                   │
+        │  ┌────────────────────────────┐   │
+        │  │            Pay             │   │  full-width, accent fill
+        │  └────────────────────────────┘   │
+        │  (role="alert" on failure)        │
+        └──────────────────────────────────┘
+
+     Principles: studio-slip identity; money + the savings story is the hero;
+     spend boldness only on the total + "You save" line, keep the rest quiet;
+     all copy
+     active-voice and plain ("You save …", "Payment failed. Please try again.").
+     One
+     motion moment only — the confirmation when status is paid — and respect
+     prefers-reduced-motion. Keyboard focus visible; disabled states legible;
+     contrast checked.
+
+     Self-review vs. generic default: a plain checkout card would be the default
+     here; the sugar-paper + riso-ink enrollment slip and the derived "You save"
+     line
+     are chosen for this specific art-studio brief, not reused chrome.
+
+     Files to change (all client/web/)
+
+     ┌───────────────────────────┬──────────────────────────────────────────────
+     ┐
+     │           File            │                    Change
+     │
+     ├───────────────────────────┼──────────────────────────────────────────────
+     ┤
+     │ src/formatPaise.ts        │ implement
+     │
+     ├───────────────────────────┼──────────────────────────────────────────────
+     ┤
+     │ src/formatPaise.test.ts   │ new — README examples + throw
+     │
+     ├───────────────────────────┼──────────────────────────────────────────────
+     ┤
+     │ src/OrderSummary.tsx      │ implement summary + pay flow; import 
+     │
+     │                           │ "./OrderSummary.css"
+     │
+     ├───────────────────────────┼──────────────────────────────────────────────
+     ┤
+     │ src/OrderSummary.css      │ new — card/receipt styling + tokens
+     │
+     ├───────────────────────────┼──────────────────────────────────────────────
+     ┤
+     │ src/OrderSummary.test.tsx │ add behaviour tests (keep existing render
+     │
+     │                           │ test)
+     │
+     ├───────────────────────────┼──────────────────────────────────────────────
+     ┤
+     │ index.html                │ add Space Grotesk + Inter <link>; page
+     │
+     │                           │ ground + centering <style>
+     │
+     └───────────────────────────┴──────────────────────────────────────────────
+     ┘
+
+     main.tsx (demo harness) stays as-is.
+
+     formatPaise.ts — integer maths only
+
+     - if (!Number.isInteger(paise)) throw new Error(...) (README: TS throws on
+     a
+     non-integer).
+     - Negatives handled defensively (prefix - via Math.abs) — robustness, not a
+     spec requirement.
+     - rupees = Math.floor(abs / 100), rem = abs % 100 (exact for safe integers;
+     % avoids fractional rounding).
+     - en-IN grouping: last 3 digits, then prefix in 2s —
+     prefix.replace(/\B(?=(\d{2})+(?!\d))/g, ",").
+     - `₹${sign}${grouped}.${String(rem).padStart(2, "0")}`.
+     - Hand-verified: 199999→₹1,999.99, 12345678→₹1,23,456.78, 5→₹0.05,
+     0→₹0.00.
+
+     OrderSummary.tsx — behaviour
+
+     State: pending, failed; isPaid = order.status === "paid".
+     handlePay: clear failed, set pending, await onPay() in try/catch (on throw
+     failed=true), finally clear pending. Button
+     disabled={isPaid || pending}, label isPaid ? "Paid" : "Pay", aria-busy
+     while pending (accessible name unchanged). Discount row + "You save" only
+     when
+     order.discount. Failure → <div role="alert">Payment failed. Please try 
+     again.</div>. Retry is automatic (pending false + failed cleared on next
+     click).
+
+     Tests
+
+     formatPaise.test.ts — the four README examples; throws on 1.5; a large case
+     (1234567890 → ₹1,23,45,67,890-style grouping, exact value hand-checked in
+     impl).
+
+     OrderSummary.test.tsx (keep existing render test; add):
+     - subtotal + total rendered via formatPaise (assert formatted strings).
+     - discount row with code + amount when present; absent when null.
+     - status:"paid" → button name "Paid" and disabled.
+     - pending: deferred onPay promise → after click button disabled and still
+     named
+     "Pay"; resolve → re-enabled.
+     - failure: onPay rejects → role="alert" present (text includes "Payment
+     failed"), button re-enabled; second click retries (onPay called twice).
+
+     Uses @testing-library/react + user-event (already deps); control timing
+     with a
+     manually resolved/rejected promise.
+
+     Verification
+
+     cd client/web
+     npm ci              # first run (installs vitest/testing-library)
+     npm test            # vitest run — all green
+     npm run typecheck   # tsc --noEmit — clean
+
+     Then: confirm formatPaise matches the four README strings; button
+     Pay/Paid/disabled rules hold; failure shows role="alert" + retry works; the
+     consumed Order shape matches types.ts and the backend's serialized order
+     (discount.code, discount.amount_paise, status). Review git diff for
+     unnecessary changes. If the dev server is useful, npm run dev renders the
+     demo
+     order from main.tsx.
+
+     Out of scope
+
+     - Backend (no changes unless a genuine API mismatch surfaces).
+     - Flutter starter (React chosen — note in NOTES.md).
+     - prompts/ export.
+     - NOTES.md: add the "chose React" line (+ one line on the design approach)
+     if not
+     already present.
+
+● Plan approved. Let me set up tasks and start implementing.
+● Update(client\web\src\formatPaise.ts)
+  ⎿  Added 18 lines, removed 1 line
+      10   * Throws an Error if `paise` is not an integer.
+      11   */
+      12  export function formatPaise(paise: number): string {
+      13 -  throw new Error("not implemented");                          
+      13 +  if (!Number.isInteger(paise)) {                              
+      14 +    throw new Error(`formatPaise expects an integer number of p
+         +aise, got ${paise}`);                                          
+      15 +  }                                                            
+      16 +                                                               
+      17 +  const sign = paise < 0 ? "-" : "";                           
+      18 +  const abs = Math.abs(paise);                                 
+      19 +  const rupees = Math.floor(abs / 100);                        
+      20 +  const remainder = abs % 100; // exact for safe integers; no f
+         +ractional rounding                                             
+      21 +                                                               
+      22 +  // en-IN grouping: last three digits, then the rest in pairs.
+      23 +  const digits = String(rupees);                               
+      24 +  const lastThree = digits.slice(-3);                          
+      25 +  const rest = digits.slice(0, -3);                            
+      26 +  const grouped = rest                                         
+      27 +    ? rest.replace(/\B(?=(\d{2})+(?!\d))/g, ",") + "," + lastTh
+         +ree                                                            
+      28 +    : lastThree;                                               
+      29 +                                                               
+      30 +  return `₹${sign}${grouped}.${String(remainder).padStart(2, "0
+         +")}`;                                                          
+      31  }
+
+● Write(client\web\src\formatPaise.test.ts)
+  ⎿  Wrote 20 lines to client\web\src\formatPaise.test.ts
+       1 import { describe, expect, it } from "vitest";
+       2 import { formatPaise } from "./formatPaise";
+       3 
+       4 describe("formatPaise", () => {
+       5   it("formats the README examples", () => {
+       6     expect(formatPaise(199999)).toBe("₹1,999.99");
+       7     expect(formatPaise(12345678)).toBe("₹1,23,456.78");
+       8     expect(formatPaise(5)).toBe("₹0.05");
+       9     expect(formatPaise(0)).toBe("₹0.00");
+      10   });
+     … +10 lines (ctrl+o to expand)
+
+● Now the OrderSummary component. Keeping the exact export signature and
+  <section aria-label="Order summary">:
+
+● Write(client\web\src\OrderSummary.tsx)
+  ⎿  Added 70 lines, removed 4 lines
+      1 +import { useState } from "react";                               
+      2 +import { formatPaise } from "./formatPaise";                    
+      3  import type { Order } from "./types";
+      4 +import "./OrderSummary.css";                                    
+      5  
+      6  /**
+      7   * Shows the subtotal, the discount (code and amount) when there
+          is one, and
+     ...
+      15   *   re-enable the button.
+      16   */
+      17  export function OrderSummary(props: { order: Order; onPay: () =
+          > Promise<void> }): JSX.Element {
+      15 -  const { order } = props;                                     
+      16 -  // Placeholder: replace with the real summary.               
+      18 +  const { order, onPay } = props;                              
+      19 +  const [pending, setPending] = useState(false);               
+      20 +  const [failed, setFailed] = useState(false);                 
+      21 +  const isPaid = order.status === "paid";                      
+      22 +                                                               
+      23 +  async function handlePay() {                                 
+      24 +    setFailed(false);                                          
+      25 +    setPending(true);                                          
+      26 +    try {                                                      
+      27 +      await onPay();                                           
+      28 +    } catch {                                                  
+      29 +      setFailed(true);                                         
+      30 +    } finally {                                                
+      31 +      setPending(false);                                       
+      32 +    }                                                          
+      33 +  }                                                            
+      34 +                                                               
+      35    return (
+      18 -    <section aria-label="Order summary">                       
+      19 -      <h2>Order {order.order_id}</h2>                          
+      36 +    <section className="slip" aria-label="Order summary">      
+      37 +      <header className="slip__head">                          
+      38 +        <span className="slip__kicker">Enrollment</span>       
+      39 +        <h2 className="slip__order">Order {order.order_id}</h2>
+      40 +      </header>                                                
+      41 +                                                               
+      42 +      <dl className="slip__lines">                             
+      43 +        <div className="slip__line">                           
+      44 +          <dt>Subtotal</dt>                                    
+      45 +          <dd className="slip__figure">{formatPaise(order.subto
+         +tal_paise)}</dd>                                               
+      46 +        </div>                                                 
+      47 +        {order.discount && (                                   
+      48 +          <div className="slip__line">                         
+      49 +            <dt>Discount · {order.discount.code}</dt>          
+      50 +            <dd className="slip__figure slip__figure--save">   
+      51 +              −{formatPaise(order.discount.amount_paise)}      
+      52 +            </dd>                                              
+      53 +          </div>                                               
+      54 +        )}                                                     
+      55 +      </dl>                                                    
+      56 +                                                               
+      57 +      <div className="slip__perforation" role="presentation" />
+      58 +                                                               
+      59 +      <div className="slip__line slip__line--total">           
+      60 +        <span>Total</span>                                     
+      61 +        <span className="slip__figure slip__total">{formatPaise
+         +(order.total_paise)}</span>                                    
+      62 +      </div>                                                   
+      63 +                                                               
+      64 +      {order.discount && (                                     
+      65 +        <p className="slip__save">                             
+      66 +          You save {formatPaise(order.discount.amount_paise)} w
+         +ith {order.discount.code}                                      
+      67 +        </p>                                                   
+      68 +      )}                                                       
+      69 +                                                               
+      70 +      <button                                                  
+      71 +        type="button"                                          
+      72 +        className="slip__pay"                                  
+      73 +        onClick={handlePay}                                    
+      74 +        disabled={isPaid || pending}                           
+      75 +        aria-busy={pending}                                    
+      76 +        data-state={isPaid ? "paid" : pending ? "pending" : "re
+         +ady"}                                                          
+      77 +      >                                                        
+      78 +        {isPaid ? "Paid" : "Pay"}                              
+      79 +      </button>                                                
+      80 +                                                               
+      81 +      {failed && (                                             
+      82 +        <div className="slip__alert" role="alert">             
+      83 +          Payment failed. Please try again.                    
+      84 +        </div>                                                 
+      85 +      )}                                                       
+      86      </section>
+      87    );
+      88  }
+
+● The kicker "Enrollment" above the heading is exactly the eyebrow-label tell
+  the design skill warns against. Let me remove it.
+
+● Update(client\web\src\OrderSummary.tsx)
+  ⎿  Removed 1 line
+      35    return (
+      36      <section className="slip" aria-label="Order summary">
+      37        <header className="slip__head">
+      38 -        <span className="slip__kicker">Enrollment</span>       
+      38          <h2 className="slip__order">Order {order.order_id}</h2>
+      39        </header>
+      40  
+
+● Now the stylesheet — the riso sugar-paper enrollment-slip identity:
+
+● Write(client\web\src\OrderSummary.css)
+  ⎿  Wrote 150 lines to client\web\src\OrderSummary.css
+       1 .slip {
+       2   /* riso two-ink tokens on sugar-paper */
+       3   --ink: #232043;
+       4   --accent: #ec3f7c;
+       5   --muted: #6c6a82;
+       6   --paid: #276b4e;
+       7   --surface: #fbfbf8;
+       8   --rule: #c9cdd6;
+       9 
+      10   box-sizing: border-box;
+     … +142 lines (ctrl+o to expand)
+
+● Now update index.html with the fonts and sugar-paper page ground:
+
+● Update(client\web\index.html)
+  ⎿  Added 18 lines
+       4      <meta charset="UTF-8" />
+       5      <meta name="viewport" content="width=device-width, initial-
+          scale=1.0" />
+       6      <title>RAYY order summary</title>
+       7 +    <link rel="preconnect" href="https://fonts.googleapis.com" 
+         +/>                                                             
+       8 +    <link rel="preconnect" href="https://fonts.gstatic.com" cro
+         +ssorigin />                                                    
+       9 +    <link                                                      
+      10 +      href="https://fonts.googleapis.com/css2?family=Inter:wght
+         +@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap
+         +"                                                              
+      11 +      rel="stylesheet"                                         
+      12 +    />                                                         
+      13 +    <style>                                                    
+      14 +      body {                                                   
+      15 +        margin: 0;                                             
+      16 +        min-height: 100vh;                                     
+      17 +        display: flex;                                         
+      18 +        align-items: center;                                   
+      19 +        justify-content: center;                               
+      20 +        padding: 2rem 1rem;                                    
+      21 +        background: #dce3e1; /* pale sugar-paper ground */     
+      22 +        -webkit-font-smoothing: antialiased;                   
+      23 +      }                                                        
+      24 +    </style>                                                   
+      25    </head>
+      26    <body>
+      27      <div id="root"></div>
+
+● Now the component tests — keeping the existing render test and adding
+  behaviour coverage:
+
+● Write(client\web\src\OrderSummary.test.tsx)
+  ⎿  Added 81 lines, removed 6 lines
+       1 -import { render, screen } from "@testing-library/react";       
+       2 -import { describe, expect, it } from "vitest";                 
+       1 +import { render, screen, waitFor } from "@testing-library/react
+         +";                                                             
+       2 +import userEvent from "@testing-library/user-event";           
+       3 +import { describe, expect, it, vi } from "vitest";             
+       4  import { OrderSummary } from "./OrderSummary";
+       5  import type { Order } from "./types";
+       6  
+       6 -const order: Order = {                                         
+       7 +const baseOrder: Order = {                                     
+       8    order_id: "ord_test_1",
+       8 -  subtotal_paise: 19999,                                       
+       9 -  total_paise: 19999,                                          
+       9 +  subtotal_paise: 38997,                                       
+      10 +  total_paise: 38997,                                          
+      11    status: "pending",
+      12    discount: null,
+      13  };
+      14  
+      15 +const discountedOrder: Order = {                               
+      16 +  ...baseOrder,                                                
+      17 +  total_paise: 31978,                                          
+      18 +  discount: { code: "KIDS18", amount_paise: 7019 },            
+      19 +};                                                             
+      20 +                                                               
+      21 +function deferred() {                                          
+      22 +  let resolve!: () => void;                                    
+      23 +  let reject!: (reason?: unknown) => void;                     
+      24 +  const promise = new Promise<void>((res, rej) => {            
+      25 +    resolve = res;                                             
+      26 +    reject = rej;                                              
+      27 +  });                                                          
+      28 +  return { promise, resolve, reject };                         
+      29 +}                                                              
+      30 +                                                               
+      31  describe("OrderSummary", () => {
+      32    it("renders", () => {
+      16 -    render(<OrderSummary order={order} onPay={async () => {}} /
+         ->);                                                            
+      33 +    render(<OrderSummary order={baseOrder} onPay={async () => {
+         +}} />);                                                        
+      34      expect(screen.getByRole("region", { name: "Order summary" }
+          )).toBeInTheDocument();
+      35    });
+      36 +                                                               
+      37 +  it("shows subtotal and total through formatPaise", () => {   
+      38 +    render(<OrderSummary order={discountedOrder} onPay={async (
+         +) => {}} />);                                                  
+      39 +    expect(screen.getByText("₹389.97")).toBeInTheDocument(); //
+         + subtotal                                                      
+      40 +    expect(screen.getByText("₹319.78")).toBeInTheDocument(); //
+         + total                                                         
+      41 +  });                                                          
+      42 +                                                               
+      43 +  it("shows the discount code and amount when there is one", ()
+         + => {                                                          
+      44 +    render(<OrderSummary order={discountedOrder} onPay={async (
+         +) => {}} />);                                                  
+      45 +    expect(screen.getByText(/KIDS18/)).toBeInTheDocument();    
+      46 +    expect(screen.getByText("−₹70.19")).toBeInTheDocument();   
+      47 +  });                                                          
+      48 +                                                               
+      49 +  it("omits the discount when there is none", () => {          
+      50 +    render(<OrderSummary order={baseOrder} onPay={async () => {
+         +}} />);                                                        
+      51 +    expect(screen.queryByText(/Discount/)).not.toBeInTheDocumen
+         +t();                                                           
+      52 +    expect(screen.queryByText(/You save/)).not.toBeInTheDocumen
+         +t();                                                           
+      53 +  });                                                          
+      54 +                                                               
+      55 +  it("reads 'Paid' and stays disabled when the order is paid", 
+         +() => {                                                        
+      56 +    render(<OrderSummary order={{ ...baseOrder, status: "paid" 
+         +}} onPay={async () => {}} />);                                 
+      57 +    const button = screen.getByRole("button", { name: "Paid" })
+         +;                                                              
+      58 +    expect(button).toBeDisabled();                             
+      59 +  });                                                          
+      60 +                                                               
+      61 +  it("disables the button while paying but still reads 'Pay'", 
+         +async () => {                                                  
+      62 +    const user = userEvent.setup();                            
+      63 +    const d = deferred();                                      
+      64 +    const onPay = vi.fn(() => d.promise);                      
+      65 +    render(<OrderSummary order={baseOrder} onPay={onPay} />);  
+      66 +                                                               
+      67 +    await user.click(screen.getByRole("button", { name: "Pay" }
+         +));                                                            
+      68 +    expect(onPay).toHaveBeenCalledTimes(1);                    
+      69 +    const button = screen.getByRole("button", { name: "Pay" });
+      70 +    expect(button).toBeDisabled();                             
+      71 +                                                               
+      72 +    d.resolve();                                               
+      73 +    await waitFor(() => expect(button).toBeEnabled());         
+      74 +  });                                                          
+      75 +                                                               
+      76 +  it("shows an alert on failure and allows retry", async () => 
+         +{                                                              
+      77 +    const user = userEvent.setup();                            
+      78 +    const onPay = vi                                           
+      79 +      .fn<[], Promise<void>>()                                 
+      80 +      .mockRejectedValueOnce(new Error("network"))             
+      81 +      .mockResolvedValueOnce(undefined);                       
+      82 +    render(<OrderSummary order={baseOrder} onPay={onPay} />);  
+      83 +                                                               
+      84 +    await user.click(screen.getByRole("button", { name: "Pay" }
+         +));                                                            
+      85 +                                                               
+      86 +    const alert = await screen.findByRole("alert");            
+      87 +    expect(alert).toHaveTextContent(/Payment failed/i);        
+      88 +    expect(screen.getByRole("button", { name: "Pay" })).toBeEna
+         +bled();                                                        
+      89 +                                                               
+      90 +    await user.click(screen.getByRole("button", { name: "Pay" }
+         +));                                                            
+      91 +    expect(onPay).toHaveBeenCalledTimes(2);                    
+      92 +    await waitFor(() => expect(screen.queryByRole("alert")).not
+         +.toBeInTheDocument());                                         
+      93 +  });                                                          
+      94  });
+
+● Now install deps and run the test suite + typecheck:
+
+  Ran 2 shell commands (ctrl+o to expand)
+● Deps installed (the EPERM was just a cleanup warning). Running tests and
+  typecheck:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● 9/10 pass. The one failure is my test over-matching — "KIDS18" appears in both
+  the discount row and the "You save" line. Let me make the assertion specific
+  to the discount row.
+
+● Update(client\web\src\OrderSummary.test.tsx)
+  ⎿  Added 1 line, removed 1 line
+      42  
+      43    it("shows the discount code and amount when there is one", ()
+           => {
+      44      render(<OrderSummary order={discountedOrder} onPay={async (
+          ) => {}} />);
+      45 -    expect(screen.getByText(/KIDS18/)).toBeInTheDocument();    
+      45 +    expect(screen.getByText("Discount · KIDS18")).toBeInTheDocu
+         +ment();                                                        
+      46      expect(screen.getByText("−₹70.19")).toBeInTheDocument();
+      47    });
+      48  
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All 10 tests pass. Now typecheck:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Typecheck caught a vitest typing mismatch — vi.fn takes a single function-type
+  argument in this version. Let me fix it.
+
+● Update(client\web\src\OrderSummary.test.tsx)
+  ⎿  Added 1 line, removed 1 line
+      76    it("shows an alert on failure and allows retry", async () => 
+          {
+      77      const user = userEvent.setup();
+      78      const onPay = vi
+      79 -      .fn<[], Promise<void>>()                                 
+      79 +      .fn<() => Promise<void>>()                               
+      80        .mockRejectedValueOnce(new Error("network"))
+      81        .mockResolvedValueOnce(undefined);
+      82      render(<OrderSummary order={baseOrder} onPay={onPay} />);
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Typecheck clean and all 10 pass. Let me do a visual check (the design skill
+  recommends screenshotting) — I'll build and capture with headless Edge. First,
+  kick off the build and update NOTES.md in parallel.
+
+  Read 1 file, ran 1 shell command (ctrl+o to expand)
+
+● Build is clean. Let me update the NOTES "What's implemented" section to
+  reflect the client is now done, then attempt the screenshot.
+
+● Update(NOTES.md)
+  ⎿  Added 11 lines, removed 4 lines
+      2  
+      3  ## What's implemented
+      4  
+      5 -Backend only this pass:                                         
+      5 +Backend:                                                        
+      6  
+      7  - `POST /orders/{order_id}/apply-discount` — look up the code, a
+         pply it, record
+      8    what was applied (incl. the funding split snapshot).
+     ...
+      12  Money logic lives in `app/services/pricing.py` (pure) and
+      13  `app/services/orders.py` / `app/services/payments.py` (rules); 
+          routes stay thin.
+      14  
+      15 -**Not done yet** (separate required deliverables): the client (
+         -`formatPaise` +                                                
+      16 -`OrderSummary`, React or Flutter) and the `prompts/` folder. A 
+         -submission needs                                               
+      17 -both — they're the next pass.                                  
+      15 +Client — **React** (`client/web/`; the Flutter starter is left 
+         +untouched):                                                    
+      16  
+      17 +- `formatPaise` — integer-maths en-IN formatter; throws on a no
+         +n-integer.                                                     
+      18 +- `OrderSummary` — subtotal / discount / total (all via `format
+         +Paise`) and the                                                
+      19 +  Pay → pending → Paid flow with a `role="alert"` failure + ret
+         +ry. Styled as a                                                
+      20 +  studio "enrollment slip" (the orders are kids' art classes) —
+         + a riso two-ink                                                
+      21 +  look on a sugar-paper ground, deliberately not the default ch
+         +eckout card.                                                   
+      22 +                                                               
+      23 +**Not done yet:** the `prompts/` folder (AI prompt-history expo
+         +rt) — required for                                             
+      24 +submission.                                                    
+      25 +                                                               
+      26  ## Decisions
+      27  
+      28  ### The two deliberately-unspecified rules
+
+● Now let me capture a screenshot to review the design visually. I'll serve the
+  build and use headless Edge.
+
+  Read 1 file, ran 2 shell commands (ctrl+o to expand)
+
+● The design renders well — the riso two-ink offset (pink shadow behind the
+  slip), sugar-paper ground, the dashed perforation, the total as anchor, and
+  the "You save" accent line all read as a distinctive studio slip rather than a
+  generic card.
+
+  One self-critique against the accessibility floor: the vivid pink #ec3f7c on
+  the near-white surface is only ~3:1 contrast — fine as the button fill (which
+  has dark ink text at ~4.9:1), but too low for the small pink text (the
+  discount amount and "You save" line). Let me darken the accent used for text
+  only, keeping the vivid pink for the fill and the offset shadow.
+
+● Update(client\web\src\OrderSummary.css)
+  ⎿  Added 2 lines, removed 1 line
+      1  .slip {
+      2    /* riso two-ink tokens on sugar-paper */
+      3    --ink: #232043;
+      4 -  --accent: #ec3f7c;                                            
+      4 +  --accent: #ec3f7c; /* vivid riso pink — fills and the offset e
+        +dge */                                                          
+      5 +  --accent-ink: #c21a5b; /* darker pink for small text (AA on th
+        +e surface) */                                                   
+      6    --muted: #6c6a82;
+      7    --paid: #276b4e;
+      8    --surface: #fbfbf8;
+
+● Update(client\web\src\OrderSummary.css)
+  ⎿  Added 1 line, removed 1 line
+      68  }
+      69  
+      70  .slip__figure--save {
+      71 -  color: var(--accent);                                        
+      71 +  color: var(--accent-ink);                                    
+      72  }
+      73  
+      74  .slip__perforation {
+
+● Update(client\web\src\OrderSummary.css)
+  ⎿  Added 1 line, removed 1 line
+      91  
+      92  .slip__save {
+      93    margin: 0.35rem 0 0;
+      94 -  color: var(--accent);                                        
+      94 +  color: var(--accent-ink);                                    
+      95    font-size: 0.9rem;
+      96    font-weight: 500;
+      97  }
+
+● Let me rebuild, re-screenshot to confirm the contrast fix, and also capture
+  the paid + error states via the demo. First rebuild and re-shoot the default
+  state:
+
+  Read 1 file, ran 2 shell commands (ctrl+o to expand)
+● Contrast fix confirmed — the "You save" line and discount amount are now a
+  deeper, readable magenta while the button fill stays vivid. (Fonts show as
+  system fallback in headless with no network; Space Grotesk/Inter load in a
+  real browser.)
+
+  Now the final verification — review the full diff for unnecessary changes:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Diff is clean and scoped — no package.json/lockfile changes (I reused existing
+  deps), no stray edits. Let me run a final consolidated verification: confirm
+  build artifacts are gitignored, and run both backend and web suites one last
+  time.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The React client is complete and verified. Build artifacts are gitignored;
+  backend (35) and web (10) suites both green.
+
+  Test results
+
+  - Web: 10/10 pass — formatPaise.test.ts (3) + OrderSummary.test.tsx (7). npm 
+  run typecheck clean (it caught a vitest generics mismatch, now fixed).
+  Production build succeeds.
+  - Backend: 35/35 still green — unchanged, no API mismatch found.
+
+  Verification against the README
+
+  - formatPaise — all four example strings exact (199999→₹1,999.99,
+  12345678→₹1,23,456.78, 5→₹0.05, 0→₹0.00), en-IN grouping, integer maths only
+  (Math.floor/%, no float division), throws on a non-integer. Verified by test
+  and the live render (₹1,999.99 / ₹1,699.99).
+  - OrderSummary — subtotal, discount (code + amount), and total all through
+  formatPaise; discount row + "You save" line only when a discount exists.
+  - Pay button — exact accessible name Pay/Paid; disabled while pending (still
+  "Pay"); Paid + disabled only when status === "paid".
+  - Failure — role="alert" containing "Payment failed", button re-enabled, retry
+  works (asserted onPay called twice).
+  - Kept the starter's file names, exports, doc-comment contract, and the
+  <section aria-label="Order summary"> the existing test relies on.
+
+  Matches the backend
+
+  The consumed Order (types.ts) is a subset of the backend's serialized order —
+  the backend's discount carries extra fields (partner_share_bps, etc.) that the
+  client ignores, reading only code/amount_paise and status. No mismatch; no
+  backend change needed.
+
+  Diff review (no unnecessary changes)
+
+  Modified: formatPaise.ts, OrderSummary.tsx, OrderSummary.test.tsx, index.html.
+  New: OrderSummary.css, formatPaise.test.ts. No package.json/lockfile edits
+  (reused existing deps); dist/ and node_modules/ confirmed gitignored. The
+  LF→CRLF notices are just Git's Windows line-ending warnings.
+
+  Design
+
+  A deliberately non-generic studio enrollment-slip grounded in the actual
+  subject (kids' art classes): riso two-ink identity — a sugar-paper ground with
+  an offset fluor-pink edge, Space Grotesk tabular numerals, a dashed
+  "perforation" rule, the total as the anchor, and the "You save …" savings line
+  as the single accent moment. I screenshotted it, caught a contrast shortfall
+  (vivid pink text on near-white was ~3:1), and darkened the accent used for
+  small text to meet AA while keeping the vivid pink for the fill and the offset
+  edge. Keyboard focus ring, legible disabled/paid states, and
+  prefers-reduced-motion are all in.
+
+  Issues found
+
+  None blocking. One note: Space Grotesk/Inter load from Google Fonts, so they
+  render as a graceful system fallback offline (as in the headless screenshot);
+  in a networked browser the intended faces apply.
+
+  The only remaining submission item is the prompts/ folder (your AI
+  prompt-history export) — that's yours to add. Want me to also drop a short
+  prompts/README.md placeholder explaining the expected export, or is that
+  covered?
+
+✻ Cogitated for 9m 37s
+
+> just two small tests: a formatPaise negative-amount case, and a second real   
+  discount-code path (e.g. FIRST5) through apply-discount.                      
+
+● Let me compute the exact expected values first, then add both tests.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Got the values (FIRST5 on ord_c_3001: amount 750, total 14249, partner 638,
+  rayy 112). Adding both tests.
+
+● Update(client\web\src\formatPaise.test.ts)
+  ⎿  Added 5 lines
+      13      expect(formatPaise(1234567890)).toBe("₹1,23,45,678.90");
+      14    });
+      15  
+      16 +  it("formats a negative amount with a leading minus", () => { 
+      17 +    expect(formatPaise(-199999)).toBe("₹-1,999.99");           
+      18 +    expect(formatPaise(-5)).toBe("₹-0.05");                    
+      19 +  });                                                          
+      20 +                                                               
+      21    it("throws on a non-integer", () => {
+      22      expect(() => formatPaise(1.5)).toThrow();
+      23      expect(() => formatPaise(100.01)).toThrow();
+
+● Update(tests\test_discounts.py)
+  ⎿  Added 13 lines
+      33      assert body["discount"]["partner_amount_paise"] + body["dis
+          count"]["rayy_amount_paise"] == 7019
+      34  
+      35  
+      36 +async def test_apply_first5_records_amount_and_split(client):  
+      37 +    # FIRST5: 500bps (no cap bind), 85/15 split, on ord_c_3001 
+         +(subtotal 14999).                                              
+      38 +    # 14999 * 500 / 10000 = 749.95 -> 750; partner 85% -> 637.5
+         + -> 638, RAYY 112.                                             
+      39 +    response = await client.post("/orders/ord_c_3001/apply-disc
+         +ount", json={"code": "FIRST5"})                                
+      40 +    assert response.status_code == 200                         
+      41 +    body = response.json()                                     
+      42 +    assert body["discount"]["code"] == "FIRST5"                
+      43 +    assert body["discount"]["amount_paise"] == 750             
+      44 +    assert body["total_paise"] == 14999 - 750                  
+      45 +    assert body["discount"]["partner_amount_paise"] == 638     
+      46 +    assert body["discount"]["rayy_amount_paise"] == 112        
+      47 +                                                               
+      48 +                                                               
+      49  async def test_unknown_code_is_404_and_no_partial_write(client,
+           db):
+      50      before = await db[ORDERS].find_one({"_id": "ord_c_3001"})
+      51      response = await client.post("/orders/ord_c_3001/apply-disc
+          ount", json={"code": "NOPE"})
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Both added and green.
+
+  - formatPaise negative case (client/web/src/formatPaise.test.ts):
+  formatPaise(-199999) === "₹-1,999.99" and -5 === "₹-0.05" — confirms the
+  leading-minus handling. Web suite now 11 passed.
+  - FIRST5 apply-discount path (tests/test_discounts.py): FIRST5 on ord_c_3001 →
+  amount 750 (no cap bind), total 14249, and the 85/15 split snapshot 638/112
+  (exercising a second code with half-up rounding on the partner share).
+  test_discounts.py now 10 passed.
+
+  Full tallies: backend 36, web 11, all green.
+
+✻ Cooked for 50s
+
+> Add a loader for the pay button once clicked and handle the states for the    
+  cta. review all the changes against the readme as the source of the truth and 
+  run the test for backend and frontend.                                        
+
+● Key constraint from the README: the button must still read "Pay" while 
+  processing (disabled). So the loader has to be a visual-only spinner that
+  doesn't change the accessible name — I'll add an aria-hidden spinner and keep
+  the text node "Pay", with aria-busy carrying the loading state semantically.
+
+● Update(client\web\src\OrderSummary.tsx)
+  ⎿  Added 1 line
+      74          aria-busy={pending}
+      75          data-state={isPaid ? "paid" : pending ? "pending" : "re
+          ady"}
+      76        >
+      77 +        {pending && <span className="slip__spinner" aria-hidden
+         +="true" />}                                                    
+      78          {isPaid ? "Paid" : "Pay"}
+      79        </button>
+      80  
+
+● Now the spinner CSS — make the button a flex container and add the animation
+  (respecting reduced motion):
+
+● Update(client\web\src\OrderSummary.css)
+  ⎿  Added 19 lines, removed 1 line
+       97  }
+       98  
+       99  .slip__pay {
+      100 -  display: block;                                             
+      100 +  display: flex;                                              
+      101 +  align-items: center;                                        
+      102 +  justify-content: center;                                    
+      103 +  gap: 0.55rem;                                               
+      104    width: 100%;
+      105    margin-top: 1.5rem;
+      106    padding: 0.85rem 1rem;
+     ...
+      113    transition: background-color 120ms ease, transform 80ms ease
+           ;
+      114  }
+      115  
+      116 +.slip__spinner {                                              
+      117 +  width: 0.95em;                                              
+      118 +  height: 0.95em;                                             
+      119 +  border: 2px solid rgba(35, 32, 67, 0.3);                    
+      120 +  border-top-color: var(--ink);                               
+      121 +  border-radius: 50%;                                         
+      122 +  animation: slip-spin 0.6s linear infinite;                  
+      123 +}                                                             
+      124 +                                                              
+      125 +@keyframes slip-spin {                                        
+      126 +  to {                                                        
+      127 +    transform: rotate(360deg);                                
+      128 +  }                                                           
+      129 +}                                                             
+      130 +                                                              
+      131  .slip__pay:hover:not([disabled]) {
+      132    background: #e22d6e;
+      133  }
+
+● Update(client\web\src\OrderSummary.css)
+  ⎿  Added 4 lines
+      166    .slip__pay {
+      167      transition: none;
+      168    }
+      169 +                                                              
+      170 +  .slip__spinner {                                            
+      171 +    animation: none;                                          
+      172 +  }                                                           
+      173  }
+
+● Now extend the pending test to assert the loader appears/disappears and
+  aria-busy toggles, while the accessible name stays "Pay":
+
+● Update(client\web\src\OrderSummary.test.tsx)
+  ⎿  Added 6 lines, removed 1 line
+      58      expect(button).toBeDisabled();
+      59    });
+      60  
+      61 -  it("disables the button while paying but still reads 'Pay'", 
+         -async () => {                                                  
+      61 +  it("shows a loader and disables the button while paying, stil
+         +l reading 'Pay'", async () => {                                
+      62      const user = userEvent.setup();
+      63      const d = deferred();
+      64      const onPay = vi.fn(() => d.promise);
+     ...
+      66  
+      67      await user.click(screen.getByRole("button", { name: "Pay" }
+          ));
+      68      expect(onPay).toHaveBeenCalledTimes(1);
+      69 +                                                               
+      70      const button = screen.getByRole("button", { name: "Pay" });
+      71      expect(button).toBeDisabled();
+      72 +    expect(button).toHaveAttribute("aria-busy", "true");       
+      73 +    expect(button.querySelector(".slip__spinner")).not.toBeNull
+         +();                                                            
+      74  
+      75      d.resolve();
+      76      await waitFor(() => expect(button).toBeEnabled());
+      77 +    expect(button).toHaveAttribute("aria-busy", "false");      
+      78 +    expect(button.querySelector(".slip__spinner")).toBeNull(); 
+      79    });
+      80  
+      81    it("shows an alert on failure and allows retry", async () => 
+          {
+
+● Now run both suites and typecheck:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All green — web 11, backend 36, typecheck clean. Let me visually confirm the
+  loader renders by screenshotting the pending state via a small static harness
+  that uses the real component CSS.
+  Made 1 scratchpad edit +41, read 1 file, ran 1 shell command (ctrl+o to expand)
+
+● The loader renders correctly — a spinner ring beside the text, the button
+  dimmed to signal processing, and the label still reads "Pay" (contract
+  honored). Let me clean up the scratch files.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Done. Loader added, CTA states handled, and everything reviewed against the
+  README.
+
+  What changed
+
+  - OrderSummary.tsx — renders an aria-hidden spinner inside the button while
+  pending, keeping the text node "Pay".
+  - OrderSummary.css — button is now a centered flex row (spinner + label);
+  added .slip__spinner ring animation, with animation: none under
+  prefers-reduced-motion.
+  - OrderSummary.test.tsx — the pending test now asserts the loader appears
+  (.slip__spinner present), aria-busy="true", button disabled and still named
+  "Pay", then after resolve: spinner gone, aria-busy="false", re-enabled.
+
+  CTA state machine (verified against README §4)
+
+  State: Ready
+  Label: Pay
+  Disabled: no
+  Visual: solid accent fill
+  README rule: "button labelled Pay" ✓
+  ────────────────────────────────────────
+  State: Processing
+  Label: Pay
+  Disabled: yes
+  Visual: spinner + dimmed, aria-busy
+  README rule: "disabled while a payment is in progress (it still reads Pay)" ✓
+  ────────────────────────────────────────
+  State: Paid (status==="paid")
+  Label: Paid
+  Disabled: yes
+  Visual: green fill
+  README rule: "reads Paid, stays disabled, only when status is paid" ✓
+  ────────────────────────────────────────
+  State: Failed
+  Label: Pay
+  Disabled: no
+  Visual: role="alert" "Payment failed. Please try again."
+  README rule: "show an error… and let the customer try again" ✓
+
+  The loader deliberately does not change the button's accessible name — that
+  was the key constraint (the README requires it to still read "Pay" while
+  processing), so the spinner is decorative/aria-hidden and aria-busy carries
+  the loading semantics. I confirmed the label stays "Pay" in the screenshot of
+  the pending state.
+
+  Full README review (source of truth)
+
+  - formatPaise: four example strings exact, en-IN grouping, integer maths only,
+  throws on non-integer; negative handled. ✓
+  - OrderSummary: subtotal, discount (code + amount), total — all via
+  formatPaise; discount shown only when present. ✓
+  - Button: all four states above match the contract exactly; kept
+  ElevatedButton-equivalent semantics for React and the <section 
+  aria-label="Order summary"> the starter test needs. ✓
+  - Starter file names, exports, and doc-comment contract preserved. ✓
+  - Backend contracts (apply-discount statuses, webhook
+  signature/idempotency/amount, integer paise, settlement snapshot) unchanged
+  and still match the README. ✓
+
+  Test results
+
+  - Frontend: 11/11 pass (formatPaise 4 + OrderSummary 7); npm run typecheck
+  clean.
+  - Backend: 36/36 pass.
+
+  The only outstanding submission item remains the prompts/ folder (your AI
+  prompt-history export).
+
+✻ Baked for 2m 15s
+
+> Do a final review for the assessement and run the test in both frontend and   
+  backend                                                                       
+
+● Let me run both suites and take a complete inventory of the assessment against
+  the README deliverables.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Now let me inventory deliverables and check the NOTES.md placeholders and
+  prompts/ status against the README requirements.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● main.tsx shows as modified — I didn't intend to touch it. Let me check what
+  changed there, and review the full backend diff for correctness.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● main.tsx (the demo harness) had its status flipped to "paid" — that's an
+  unintended change that would make the live demo show the non-interactive
+  "Paid" state instead of the interactive Pay flow. I'll revert it to "pending".
+
+● Update(client\web\src\main.tsx)
+  ⎿  Added 1 line, removed 1 line
+       7    order_id: "ord_demo_1",
+       8    subtotal_paise: 199999,
+       9    total_paise: 169999,
+      10 -  status: "paid",                                              
+      10 +  status: "pending",                                           
+      11    discount: { code: "DEMO15", amount_paise: 30000 },
+      12  };
+      13  
+
+● The note says the file was modified externally. Let me confirm main.tsx is now
+  clean (back to original) and verify no other unexpected changes exist.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● main.tsx is back to the original — the change list is now exactly the intended
+  set. Everything is clean and all tests pass.
+
+  Final assessment review
+
+  Test results ✅
+
+  - Backend: 36/36 pass (make test / mongomock).
+  - Frontend: 11/11 pass; npm run typecheck clean; production build succeeds.
+
+  Deliverables vs. README
+
+  ┌─────┬───────────────────────────────────┬───────────────────────────────┐
+  │  #  │            Requirement            │            Status             │
+  ├─────┼───────────────────────────────────┼───────────────────────────────┤
+  │     │ POST /orders/{id}/apply-discount  │ ✅ app/services/orders.py,    │
+  │ 1   │ — lookup, apply, record (%, cap,  │ atomic write, split snapshot  │
+  │     │ expiry, funding split)            │                               │
+  ├─────┼───────────────────────────────────┼───────────────────────────────┤
+  │     │ POST /webhooks/payment — HMAC     │ ✅ app/services/payments.py,  │
+  │ 2   │ verify, mark paid, record,        │ signature + amount + dedupe   │
+  │     │ idempotent                        │                               │
+  ├─────┼───────────────────────────────────┼───────────────────────────────┤
+  │     │ Tests for both, in the existing   │ ✅ test_discounts.py,         │
+  │ 3   │ suite                             │ test_webhooks.py,             │
+  │     │                                   │ test_pricing.py               │
+  ├─────┼───────────────────────────────────┼───────────────────────────────┤
+  │     │ Client (React) — formatPaise,     │                               │
+  │ 4   │ summary,                          │ ✅ with tests; starter        │
+  │     │ Pay/Paid/disabled/loader,         │ contracts preserved           │
+  │     │ failure+retry                     │                               │
+  ├─────┼───────────────────────────────────┼───────────────────────────────┤
+  │ 5   │ Settlement note (what's stored    │ ✅ in NOTES.md                │
+  │     │ per order, what the query reads)  │                               │
+  ├─────┼───────────────────────────────────┼───────────────────────────────┤
+  │ 6   │ AI-caught mistake, trust caveats, │ ⚠️ 2 placeholders unfilled    │
+  │     │  time spent                       │ (AI mistake, time spent)      │
+  ├─────┼───────────────────────────────────┼───────────────────────────────┤
+  │ —   │ NOTES.md                          │ ✅ present                    │
+  ├─────┼───────────────────────────────────┼───────────────────────────────┤
+  │     │                                   │ ❌ missing — required; "a     │
+  │ —   │ prompts/ folder                   │ submission without prompts/   │
+  │     │                                   │ cannot pass"                  │
+  ├─────┼───────────────────────────────────┼───────────────────────────────┤
+  │ —   │ Two unspecified decisions         │ ✅ documented (half-up;       │
+  │     │ (rounding, second code)           │ reject 2nd)                   │
+  ├─────┼───────────────────────────────────┼───────────────────────────────┤
+  │ —   │ Money logic out of route handlers │ ✅ services/pricing own it;   │
+  │     │                                   │ routes thin                   │
+  └─────┴───────────────────────────────────┴───────────────────────────────┘
+
+  Code quality notes
+
+  - Clean, scoped diff — no stray changes (caught and reverted an external
+  main.tsx edit).
+  - Build artifacts (dist/, node_modules/) gitignored; no lockfile churn.
+  - Design: distinctive, accessible (AA contrast fix, focus ring,
+  reduced-motion, aria-busy loader that keeps the "Pay" accessible name).
+
+  Two things blocking a clean submission (both yours to provide)
+
+  1. prompts/ folder — the README is explicit that a submission without it
+  cannot pass. This is your AI prompt-history export (raw dump or screenshots).
+  2. NOTES.md placeholders — line 111 (the one AI mistake you caught) and line
+  127 (time spent / where it went). These are first-person and I shouldn't
+  fabricate them.
+
+  Everything implementable is done and green. Want me to (a) create the prompts/
+  folder with a short README.md explaining the expected export format, and/or
+  (b) draft suggested wording for the two NOTES placeholders for you to edit and
+  confirm?
+
+✻ Brewed for 1m 3s
