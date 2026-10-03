@@ -81,6 +81,23 @@ async def test_amount_checked_against_discounted_total(client):
     assert (await client.post("/webhooks/payment", content=raw, headers=headers)).status_code == 200
 
 
+async def test_webhook_2_after_apply_2_checks_discounted_amount(client, db):
+    # fixtures.json webhook_2: pay_c_9002 -> ord_c_3001, amount 14999, after apply_2.
+    # apply_2 (KIDS18) discounts ord_c_3001 from 14999 to 12299, so the fixture's
+    # pre-discount 14999 is a mismatch (400); paying the real 12299 succeeds.
+    await client.post("/orders/ord_c_3001/apply-discount", json={"code": "KIDS18"})
+
+    stale, headers = _signed("ord_c_3001", 14999, payment_id="pay_c_9002")
+    assert (await client.post("/webhooks/payment", content=stale, headers=headers)).status_code == 400
+    assert (await db[ORDERS].find_one({"_id": "ord_c_3001"}))["status"] == "pending"
+
+    raw, headers = _signed("ord_c_3001", 12299, payment_id="pay_c_9002")
+    assert (await client.post("/webhooks/payment", content=raw, headers=headers)).status_code == 200
+    order = await db[ORDERS].find_one({"_id": "ord_c_3001"})
+    assert order["status"] == "paid"
+    assert order["payment"] == {"payment_id": "pay_c_9002", "amount_paise": 12299}
+
+
 async def test_duplicate_delivery_is_idempotent(client, db):
     # The gateway delivers twice; the second must be a no-op.
     raw, headers = _signed("ord_c_3003", 45900, payment_id="pay_c_9001")

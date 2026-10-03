@@ -46,6 +46,19 @@ async def test_apply_first5_records_amount_and_split(client):
     assert body["discount"]["rayy_amount_paise"] == 112
 
 
+async def test_apply_kids18_on_ord_c_3001(client):
+    # apply_2 (fixtures.json): KIDS18 on ord_c_3001 (subtotal 14999).
+    # 1800bps -> 2699.82 -> 2700 (half-up); 70/30 split -> partner 1890, RAYY 810.
+    response = await client.post("/orders/ord_c_3001/apply-discount", json={"code": "KIDS18"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["discount"]["code"] == "KIDS18"
+    assert body["discount"]["amount_paise"] == 2700
+    assert body["total_paise"] == 12299
+    assert body["discount"]["partner_amount_paise"] == 1890
+    assert body["discount"]["rayy_amount_paise"] == 810
+
+
 async def test_unknown_code_is_404_and_no_partial_write(client, db):
     before = await db[ORDERS].find_one({"_id": "ord_c_3001"})
     response = await client.post("/orders/ord_c_3001/apply-discount", json={"code": "NOPE"})
